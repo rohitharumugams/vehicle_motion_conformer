@@ -1,0 +1,5 @@
+# Python 3.12+. Install your preferred CPU/CUDA PyTorch build first.
+torch>=2.7
+nemo_toolkit[asr]==3.0.0
+numpy>=1.26
+matplotlib>=3.8
