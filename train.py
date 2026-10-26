@@ -5,9 +5,39 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import config as C
-from data import load, samples, split
+from data import load, samples, split3
 from loss import motion_loss
 from model import MotionModel
+
+
+def prefetch_loader(path_list, max_prefetch=4):
+    """Prefetch samples in a background thread so disk I/O overlaps with GPU compute."""
+    from queue import Queue
+    from threading import Thread
+
+    q = Queue(maxsize=max_prefetch)
+    sentinel = object()
+
+    def worker():
+        for p in path_list:
+            try:
+                data = load(p)
+                q.put((p, data, None))
+            except Exception as e:
+                q.put((p, None, e))
+        q.put(sentinel)
+
+    t = Thread(target=worker, daemon=True)
+    t.start()
+
+    while True:
+        item = q.get()
+        if item is sentinel:
+            break
+        p, data, err = item
+        if err is not None:
+            raise err
+        yield p, data
 
 
 def main():
@@ -15,15 +45,31 @@ def main():
     parser.add_argument('--data', default=C.DATA)
     parser.add_argument('--epochs', type=int, default=C.EPOCHS)
     parser.add_argument('--checkpoint', default='model.pt')
+    parser.add_argument('--split', default='3way',
+                        help='Path to existing split.json, or "2way" or "3way"')
     args = parser.parse_args()
     if args.epochs < 1:
         parser.error('--epochs must be positive')
     torch.manual_seed(C.SEED)
     rng = np.random.default_rng(C.SEED)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    train, val = split(samples(args.data))
-    partition = {'train': list(map(str, train)), 'val': list(map(str, val))}
-    Path('split.json').write_text(json.dumps(partition, indent=2))
+    device = ('cuda' if torch.cuda.is_available()
+              else ('mps' if torch.backends.mps.is_available() else 'cpu'))
+    ckpt_path = Path(args.checkpoint).resolve()
+    run_dir = ckpt_path.parent
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if Path(args.split).is_file():
+        partition = json.loads(Path(args.split).read_text())
+        train = [Path(p) for p in partition['train']]
+        val = [Path(p) for p in partition['val']]
+    elif args.split == '2way':
+        from data import split as split2
+        train, val = split2(samples(args.data))
+        partition = {'train': list(map(str, train)), 'val': list(map(str, val))}
+    else:
+        train, val, test = split3(samples(args.data))
+        partition = {'train': list(map(str, train)), 'val': list(map(str, val)),
+                     'test': list(map(str, test))}
+    (run_dir / 'split.json').write_text(json.dumps(partition, indent=2))
     model = MotionModel().to(device)
     print(f'{device}: {sum(p.numel() for p in model.parameters()):,} parameters; '
           f'{len(train)} training clips, {len(val)} validation clips')
@@ -40,8 +86,11 @@ def main():
                 rng.shuffle(paths)
             with torch.set_grad_enabled(training):
                 phase = 'train' if training else 'val'
-                for p in tqdm(paths, desc=f'epoch {epoch + 1}/{args.epochs} {phase}', unit='clip', leave=False):
-                    x, y, ix, seconds, p0 = load(p)
+                for p, (x, y, ix, seconds, p0) in tqdm(
+                    prefetch_loader(paths), total=len(paths),
+                    desc=f'epoch {epoch + 1}/{args.epochs} {phase}',
+                    unit='clip', leave=False
+                ):
                     x = torch.from_numpy(x)[None].to(device)
                     y = torch.from_numpy(y).to(device)
                     ix = torch.from_numpy(ix).to(device)
@@ -58,7 +107,6 @@ def main():
                         opt.step()
                     total += loss.item() * len(y)
                     heads += terms['ce'].detach().cpu().numpy() * len(y)
-                    # Diagnostic MAE against quantized target centres, in each head's units.
                     truth = torch.stack([b[y[:, j]] for j, b in enumerate(model.bins)], -1)
                     mae += (terms['means'].detach() - truth).abs().sum(0).cpu().numpy()
                     count += len(y)
@@ -69,18 +117,18 @@ def main():
         print(f"{epoch + 1}: train={record['train']:.4f} val={record['val']:.4f} "
               f"val CE={np.round(record['val_ce'], 3)}")
         history.append(record)
-        Path('history.json').write_text(json.dumps(history, indent=2))
+        (run_dir / 'history.json').write_text(json.dumps(history, indent=2))
         if record['val'] < best:
             best = record['val']
             checkpoint = dict(model=model.state_dict(), bins=[b.tolist() for b in C.BINS],
                               model_config=model.settings, feature_config=C.feature_config(),
-                              names=list(C.NAMES), state_file=C.STATE, architecture='nemo_conformer_motion_v1',
+                              names=list(C.NAMES), state_file=C.STATE,
+                              architecture='nemo_conformer_motion_v1',
                               epoch=epoch + 1, val_loss=best, split=partition,
                               loss_settings=dict(head_weights=list(C.HEAD_WEIGHTS),
                                                  kinematic_weight=C.KINEMATIC_WEIGHT,
                                                  acceleration_weight=C.ACCELERATION_WEIGHT))
-            Path(args.checkpoint).parent.mkdir(parents=True, exist_ok=True)
-            torch.save(checkpoint, args.checkpoint)
+            torch.save(checkpoint, ckpt_path)
 
 
 if __name__ == '__main__':

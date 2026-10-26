@@ -27,7 +27,6 @@ def load_audio(path, settings=None):
     if not np.isfinite(a).all() or np.any(a < 0):
         raise ValueError('Expected finite nonnegative magnitude STFT, not complex/log features')
     half = cfg['n_fft'] / (2 * cfg['spec_sr'])
-    # Skip frames that rely on initial padding. Availability includes the full window.
     keep = t >= half - 1e-8 if cfg['centered'] else np.ones(len(t), dtype=bool)
     available = t[keep] + (half if cfg['centered'] else cfg['n_fft'] / cfg['spec_sr'])
     seconds = np.arange(1, int(np.floor(t[-1] * cfg['output_hz'] + 1e-6)) + 1,
@@ -57,9 +56,8 @@ def load(path, bins=BINS):
     if s.shape != (len(t), 4) or not np.isfinite(s).all():
         raise ValueError(f'{p}: expected finite state array [frames, 4]')
     p0 = initial_position(p)
-    # File order [px, vx, py, vy] -> head order [vx, vy, px, py].
     values = np.stack([np.interp(seconds, t, s[:, j]) for j in (1, 3, 0, 2)], 1)
-    values[:, :2] *= 3.6  # m/s -> km/h, preserving signed components.
+    values[:, :2] *= 3.6
     for j, b in enumerate(bins):
         if np.any((values[:, j] < b[0]) | (values[:, j] > b[-1])):
             raise ValueError(f'{p}: head {j} target outside bins; widen BINS in config.py')
@@ -80,3 +78,32 @@ def split(paths):
     n = max(1, int(0.2 * len(keys)))
     return ([p for key in keys[n:] for p in groups[key]],
             [p for key in keys[:n] for p in groups[key]])
+
+
+def split3(paths, n_test_groups=2, n_val_groups=1):
+    """Three-way train/val/test split grouped by source_clip to prevent leakage.
+
+    Groups are sorted then shuffled with the global SEED for reproducibility.
+    The first n_test_groups become the locked blind test set, the next
+    n_val_groups become the validation set, and all remaining groups are
+    used for training.  Call once; write the result to split.json and
+    never recompute from a different dataset root or seed.
+    """
+    groups = {}
+    for p in paths:
+        meta = json.loads((p / 'metadata/simulation_parameters.json').read_text())
+        groups.setdefault(meta['source_clip'], []).append(p)
+    keys = sorted(groups)
+    n_min = n_test_groups + n_val_groups + 1
+    if len(keys) < n_min:
+        raise ValueError(
+            f'Need at least {n_min} distinct source_clip groups '
+            f'(have {len(keys)}); reduce n_test_groups or n_val_groups')
+    np.random.default_rng(SEED).shuffle(keys)
+    test_keys  = keys[:n_test_groups]
+    val_keys   = keys[n_test_groups:n_test_groups + n_val_groups]
+    train_keys = keys[n_test_groups + n_val_groups:]
+    train = [p for key in train_keys for p in groups[key]]
+    val   = [p for key in val_keys   for p in groups[key]]
+    test  = [p for key in test_keys  for p in groups[key]]
+    return train, val, test

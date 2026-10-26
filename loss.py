@@ -6,11 +6,7 @@ from config import (HEAD_WEIGHTS, KINEMATIC_WEIGHT, ACCELERATION_WEIGHT,
 
 def motion_loss(logits, target, bins, seconds, p0,
                 kinematic_weight=KINEMATIC_WEIGHT, acceleration_weight=ACCELERATION_WEIGHT):
-    """Four individually computed CE losses + optional soft physics penalties.
-
-    logits: four [timestamps, bins] tensors, target: [timestamps, 4].
-    Bins: signed km/h for v; metres for p. No CTC alignment/collapse is used.
-    """
+    """Four categorical CE losses plus optional soft physics penalties."""
     ce = torch.stack([F.cross_entropy(z, target[:, j]) for j, z in enumerate(logits)])
     weights = ce.new_tensor(HEAD_WEIGHTS)
     total = (ce * weights).sum() / weights.sum()
@@ -20,10 +16,8 @@ def motion_loss(logits, target, bins, seconds, p0,
     position = means[:, 2:]
     dt = torch.diff(torch.cat((times.new_zeros(1), times)))
     previous_p = torch.cat((p0.reshape(1, 2), position[:-1]), 0)
-    # The starting velocity is UNKNOWN: use first predicted velocity for interval 1.
     previous_v = torch.cat((velocity[:1], velocity[:-1]), 0)
     residual = position - previous_p - 0.5 * (velocity + previous_v) * dt[:, None]
-    # Scale metres to a fixed, meaningful range; do not divide quantized positions by dt.
     kinematic = F.smooth_l1_loss(residual / 2.0, torch.zeros_like(residual))
     acceleration = means.new_zeros(())
     if len(times) > 1:

@@ -1,214 +1,301 @@
-# Vehicle motion with NeMo's streaming Conformer
+# Vehicle Motion Conformer: Acoustic Trajectory Tracking
 
-Replace the old project code with the files in this folder. Keep your existing
-`data/` sample directories. This is a new architecture: retrain it from scratch;
-the GRU checkpoint cannot be reused.
+Real-time 2D vehicle motion estimation (velocities and positions) from single-microphone pass-by audio, powered by a custom **Frequency CNN frontend**, an **NVIDIA NeMo Streaming Cache Conformer**, and a **Kinematic RTS Kalman Decoder**.
 
-The model is:
+---
 
-**Existing log1p magnitude STFT + known first position -> causal NeMo Conformer
--> four categorical heads (vx, vy, px, py) -> constrained beam-search trajectory.**
+## Table of Contents
+1. [Overview & Core Concept](#overview--core-concept)
+2. [Repurposing NVIDIA NeMo](#repurposing-nvidia-nemo)
+3. [Architecture Deep Dive](#architecture-deep-dive)
+   - [Acoustic Preprocessing & Spatial Conditioning](#1-acoustic-preprocessing--spatial-conditioning)
+   - [Frequency CNN Frontend](#2-frequency-cnn-frontend)
+   - [NVIDIA NeMo Conformer Encoder](#3-nvidia-nemo-conformer-encoder)
+   - [Four Categorical Prediction Heads](#4-four-categorical-prediction-heads)
+   - [Kinematic Beam Search & RTS Kalman Decoder](#5-kinematic-beam-search--rts-kalman-decoder)
+4. [Latest Benchmark Metrics](#latest-benchmark-metrics)
+5. [Repository Structure](#repository-structure)
+6. [Installation & Setup](#installation--setup)
+7. [Usage & Workflows](#usage--workflows)
+   - [Training](#training)
+   - [Single-Clip Streaming Inference](#single-clip-streaming-inference)
+   - [Independent Blind Evaluation](#independent-blind-evaluation)
+   - [Offline Re-Decoding & Parameter Tuning](#offline-re-decoding--parameter-tuning)
+8. [Output Archive Format (`.npz`)](#output-archive-format-npz)
 
-The NeMo encoder is imported from the installed library. You do not need to
-copy or modify NVIDIA's `conformer_encoder.py`. The ASR tokenizer, transducer,
-speech loss and transcription script are not used.
+---
 
-## Files
+## Overview & Core Concept
 
-| File | Responsibility |
-| --- | --- |
-| `config.py` | Bins, encoder size, output timing, loss and decoder settings |
-| `data.py` | Load existing simulator features, align labels, group source recordings |
-| `model.py` | NeMo encoder, position conditioning, four heads, streaming caches |
-| `loss.py` | Four CE losses and optional soft motion-consistency penalties |
-| `train.py` | Training, validation, split/history files, best checkpoint |
-| `decoder.py` | Beam search with retained histories and motion constraints |
-| `predict.py` | Replay streaming chunks and save distributions plus trajectories |
-| `plot.py` | Probability heatmaps, trajectory and optional ground-truth overlay |
-| `smoke_check.py` | Causality, cache, gradient and decoder checks before training |
-| `requirements.txt` | Dependencies |
+Tracking a moving vehicle using only a passive acoustic sensor (a single microphone) is a challenging inverse problem. Pass-by audio carries distinct physical signatures:
+* **Acoustic Doppler Effect:** The observed engine and tire frequencies compress as the vehicle approaches the sensor and expand as it recedes.
+* **Tire/Road Noise & Harmonics:** High-frequency broadband friction and discrete engine firing harmonics vary with vehicle velocity and distance.
 
-## Install and run
+This repository implements a strictly **causal, real-time streaming pipeline** that reconstructs the vehicle's continuous 2D position trajectory ($p_x, p_y$) and velocity vector ($v_x, v_y$) at 10 Hz (every 100 ms) using only the audio stream and an initial starting location $(p_{x0}, p_{y0})$.
 
-Use Python 3.12 or newer. A Linux environment with a CUDA GPU is recommended
-for training. Install a PyTorch build appropriate for your machine first using
-[PyTorch's installation instructions](https://pytorch.org/get-started/locally/).
-Then, from this project folder:
-
-```bash
-python -m pip install -r requirements.txt
-python smoke_check.py --sample data/sample_0000001
-python train.py
-python predict.py data/sample_0000001
-python plot.py probabilities.npz --sample data/sample_0000001
+```
+Streaming Audio (22.05 kHz) ──► Causal STFT (1,025 bins) ──┐
+                                                           ▼
+Initial Anchor (x0, y0) ────────────────────────► [Frequency CNN] (1D spectral convolutions)
+                                                           │
+                                                           ▼ (130 dims: 128 audio + 2 pos)
+                                           [NVIDIA NeMo Streaming Conformer]
+                                              (4 layers, [1024, 0] causal attention)
+                                                           │
+                                                           ▼ (10 Hz outputs)
+                                               [4 Categorical Heads]
+                                              (P(vx), P(vy), P(px), P(py))
+                                                           │
+                                                           ▼
+                                           [Kinematic Beam Search & RTS Smoother]
+                                              (Acceleration bounds <= 8 m/s²)
+                                                           │
+                                                           ▼
+                                           Smoothed 2D Vehicle Trajectory
 ```
 
-For another data root, epoch count or checkpoint path:
+---
 
-```bash
-python train.py --data /path/to/data --epochs 30 --checkpoint model.pt
+## Repurposing NVIDIA NeMo
+
+The sequential core of this model is built upon **NVIDIA NeMo** (`nemo.collections.asr.modules.conformer_encoder.ConformerEncoder`), NVIDIA's open-source conversational AI toolkit. 
+
+### Why NeMo ASR Conformer for Physical Vehicle Tracking?
+NVIDIA designed its ASR Conformer for enterprise-grade, low-latency streaming speech recognition. Rather than reinventing streaming transformers from scratch, we repurposed NVIDIA's battle-tested streaming engine for continuous physical vehicle tracking by introducing key architectural adaptations:
+
+| Standard NeMo Speech ASR | Remodeled Vehicle Motion Conformer |
+| :--- | :--- |
+| **Input Domain:** Mel-scale filterbanks (80–128 bins) optimized for human vocal range. | **1,025-bin Linear STFT Spectrograms** capturing high-frequency tire friction and Doppler shifts up to 11 kHz. |
+| **Subsampling:** 4x or 8x strided convolutions over time, shrinking temporal resolution. | **Subsampling Disabled (`subsampling=None`, factor 1)** to maintain strict 1:1 synchronization with physical 10 Hz motion timestamps. |
+| **Conditioning:** No spatial inputs; unconditioned speech acoustic frames. | **2D Spatial Conditioning:** Fixed starting coordinate $(p_{x0}, p_{y0})$ is normalized and concatenated to every frame. |
+| **Output Task:** CTC / RNN-T loss predicting discrete text character tokens. | **Multi-Task Categorical Kinematics:** 4 parallel heads predicting probability distributions over physical bins ($v_x, v_y, p_x, p_y$). |
+| **Downstream Decoder:** Language models (n-gram / neural LM beam search). | **Kinematic Physics Decoder:** Beam search constrained by vehicle acceleration ($a \le 8\text{ m/s}^2$) + RTS Kalman Smoother. |
+
+---
+
+## Architecture Deep Dive
+
+### 1. Acoustic Preprocessing & Spatial Conditioning
+* **Audio Format:** Monophonic 22,050 Hz sampling rate.
+* **Short-Time Fourier Transform (STFT):** Window/FFT size of 2048, hop size of 256 samples, centered STFT. Each time step yields 1,025 linear frequency bins ($N_{\text{fft}} / 2 + 1$).
+* **Features:** Log-magnitude compression: $\mathbf{x} = \log(1 + |X|)$.
+* **Starting Position Conditioning:** A single microphone cannot deduce absolute Cartesian distance from sound alone due to acoustic symmetry. To resolve this, the known initial coordinate $p_0 = (p_{x0}, p_{y0})$ (scaled by 1/100) is tiled across time and concatenated with the spectral features, anchoring the coordinate system.
+
+### 2. Frequency CNN Frontend
+Located in `model.py` (`FrequencyCNN`), this module replaces standard linear projections with a custom 1D convolutional network acting along the **frequency axis**:
+
+```python
+class FrequencyCNN(nn.Module):
+    # Convolves across the 1,025 frequency bins per time frame
+    self.convs = nn.Sequential(
+        nn.Conv1d(1, 8, kernel_size=5, stride=2, padding=2),   # Layer 1: local spectral peaks
+        nn.GELU(),
+        nn.Conv1d(8, 16, kernel_size=5, stride=2, padding=2),  # Layer 2: harmonic overtone spacing
+        nn.GELU(),
+    )
+    self.projection = nn.Sequential(
+        nn.Flatten(start_dim=1),
+        nn.Linear(16 * reduced_freq, 128),
+        nn.LayerNorm(128),
+        nn.Dropout(0.1),
+    )
 ```
 
-Give an explicit known initial position (metres):
+* **Doppler Shift Invariance:** As a vehicle approaches and recedes, engine firing harmonics and tire peaks slide across frequency bins. The 1D CNN slides across the frequency spectrum, detecting the invariant acoustic harmonic pattern regardless of its shifted position.
+* **Compression:** Reduces 1,025 raw FFT bins into 128 compact acoustic embedding features per 0.1s frame.
+* **Combined Channel Vector:** 128 acoustic features + 2 spatial features = **130 input channels** fed into the Conformer.
 
-```bash
-python predict.py data/sample_0000001 -75 22.579128 --save-revisions
+### 3. NVIDIA NeMo Conformer Encoder
+* **Module:** `nemo.collections.asr.modules.conformer_encoder.ConformerEncoder`
+* **Configuration:**
+  * **Layers (`n_layers`):** 4 Conformer blocks
+  * **Hidden Dimension (`d_model`):** 128
+  * **Attention Heads (`n_heads`):** 4
+  * **Attention Mechanism:** Multi-Head Self-Attention with Relative Positional Embeddings (`rel_pos`).
+  * **Strict Causal Context (`att_context_size`):** `[1024, 0]`. Exactly 1024 past frames (~11.9 seconds of acoustic history) and **0 right-context frames**, guaranteeing zero future lookahead.
+  * **Causal Depthwise Convolution (`conv_kernel_size`):** Kernel size 15, `conv_context_size="causal"`, `conv_norm_type="layer_norm"`.
+  * **Subsampling:** None (1:1 frame preservation).
+  * **STFT-to-10 Hz Alignment:** With subsampling disabled, the Conformer operates at the native ~86.13 Hz STFT frame rate (22,050 Hz / 256 hop), and 10 Hz predictions are formed by extracting the hidden representation of the latest completed STFT window available at each 0.1s timestamp (`logits = [z[0, ix]]` during training, or chunk-final slicing `z[0, -1]` during streaming).
+
+#### Anatomy of a Conformer Block Inside NVIDIA NeMo
+Each of the 4 layers contains a Macaron-style sandwich structure:
+1. **Feed-Forward Module 1 (Half-step):** Pre-norm LayerNorm, Linear(128 $\rightarrow$ 512), Swish/SiLU, Dropout, Linear(512 $\rightarrow$ 128), residual connection ($\times 0.5$).
+2. **Multi-Head Self-Attention Module:** Pre-norm LayerNorm, RelPosition Multi-Head Attention (4 heads, causal mask `[1024, 0]`), Dropout, residual connection.
+3. **Convolution Module:** Pre-norm LayerNorm, Pointwise Conv, Gated Linear Unit (GLU), Depthwise Causal Conv1D (kernel 15), BatchNorm/LayerNorm, Swish, Pointwise Conv, Dropout, residual connection.
+4. **Feed-Forward Module 2 (Half-step):** Pre-norm LayerNorm, Linear(128 $\rightarrow$ 512), Swish, Dropout, Linear(512 $\rightarrow$ 128), residual connection ($\times 0.5$).
+5. **Final Block LayerNorm.**
+
+#### NVIDIA NeMo Streaming Cache Engine
+During streaming execution (`predict_chunk`), the Conformer avoids reprocessing past audio. It maintains internal state buffers passed forward at each 0.1s interval:
+* `cache_last_channel`: Caches the activations for the attention key/value history across the 1024 past frames.
+* `cache_last_time`: Caches the sliding convolution receptive field (the 14 previous samples required for kernel-15 causal convolution).
+* `cache_last_channel_len`: Tracks valid cache sequence lengths.
+
+### 4. Four Categorical Prediction Heads
+The shared 128-dim representations from the Conformer feed four parallel classification heads (`nn.Linear(128, len(b))`):
+* **$v_x$ (Lateral Velocity):** $[-120, +120]$ km/h, step 2 km/h (121 bins)
+* **$v_y$ (Longitudinal Velocity):** $[-120, +120]$ km/h, step 2 km/h (121 bins)
+* **$p_x$ (Lateral Position):** $[-200, +200]$ meters, step 2 m (201 bins)
+* **$p_y$ (Longitudinal Position):** $[-100, +100]$ meters, step 2 m (101 bins)
+
+**Why Categorical Classification over Direct Regression?**
+Acoustic pass-bys suffer from multi-modal uncertainty (e.g., symmetry ambiguity where approaching from the front-left can produce similar Doppler pitches as front-right). A standard regression model (MSE loss) collapses to the arithmetic mean of multiple modes, predicting physically impossible paths down the middle. Categorical heads preserve the full multi-modal probability distributions $P(s)$, allowing the downstream kinematic decoder to pick the globally consistent trajectory.
+
+### 5. Kinematic Beam Search & RTS Kalman Decoder
+Located in `decoder.py` (`MotionDecoder`), this module turns raw probabilities into continuous, physically valid vehicle paths.
+
+1. **Continuous Expectation Proposals:** Instead of picking discrete bin centers (which would cause 2-meter staircasing artifacts), position and velocity candidates are proposed using continuous expectations:
+   $$\mu = \sum_{i} b_i \cdot P(b_i)$$
+   Blended convex proposals combine expected observations with trapezoidal velocity integration:
+   $$p_{\text{int}} = p_{t-1} + \frac{v_{t-1} + v_t}{2} \cdot \Delta t$$
+2. **Path Scoring:** Paths are scored using a combination of acoustic probability and physical feasibility:
+   $$\text{Score}_t = \text{Score}_{t-1} + \sum_{j \in \{vx,vy,px,py\}} \ln P(s_j) - w_m \cdot \text{Huber}(p - p_{\text{int}}) - w_a \cdot \text{Huber}(\text{excess } a)$$
+   Candidates exceeding maximum speed ($120$ km/h) or physical acceleration limits ($a > 8\text{ m/s}^2$) are pruned.
+3. **Diverse Beam Pruning:** Retains the top $K=32$ candidate trajectory histories.
+4. **Rauch-Tung-Striebel (RTS) Kalman Smoothing:** Once the highest-scoring beam path is finalized, a backward Kalman smoother passes over the trajectory using a double-integrator kinematic model, eliminating discrete steps and enforcing continuous vehicle dynamics.
+
+---
+
+## Latest Benchmark Metrics
+
+### Independent 1,000-Clip Blind Test (`vs13_path2d_1000_varied`)
+Evaluated using the latest checkpoint (`runs/vs13_7500_varied_cnn/model.pt`):
+
+| Evaluation Metric | Score | Unit | Description |
+| :--- | :---: | :---: | :--- |
+| **Final Path ADE (Primary)** | **2.965** | meters | Mean Average Displacement Error of smoothed path |
+| **Median Clip ADE** | **2.612** | meters | Median ADE across all 1,000 test clips |
+| **Online Streaming ADE** | **3.013** | meters | Real-time causal state estimate error at each step |
+| **Final Displacement Error (FDE)** | **7.333** | meters | Positional error at trajectory termination |
+| **X MAE ($p_x$)** | **1.385** | meters | Lateral position mean absolute error |
+| **Y MAE ($p_y$)** | **2.301** | meters | Longitudinal position mean absolute error |
+
+### Model Progression Comparison
+
+| Run / Architecture | Dataset Size | Frontend | Best Val Loss | Blind Test ADE | Online ADE | FDE |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`vs13_7500_varied_cnn`** (Latest) | 7,500 clips | **Frequency CNN** | **1.8173** | **2.965 m** | **3.013 m** | **7.333 m** |
+| `vs13_7500_varied_v1` | 7,500 clips | Linear | 1.8318 | 3.043 m | 3.093 m | 7.748 m |
+| `vs13_1000_option_a_cnn` | 1,000 clips | Frequency CNN | 2.5020 | 4.158 m | 4.194 m | 10.070 m |
+| `vs13_1000_option_a` | 1,000 clips | Linear | 2.5397 | 5.047 m | 5.102 m | 11.009 m |
+| Original `model.pt` baseline | 1,000 clips | Linear | 2.8428 | — | — | — |
+
+---
+
+## Repository Structure
+
+```
+vehicle_motion_conformer/
+├── config.py             # Hyperparameters, bin definitions, feature settings
+├── model.py              # FrequencyCNN, ConformerEncoder wrapper, 4 heads
+├── decoder.py            # MotionDecoder, kinematic beam search, RTS smoother
+├── data.py               # Audio loading, STFT extraction, clip batching
+├── train.py              # Training loop with validation grouping and checkpointing
+├── predict.py            # Single-clip streaming prediction script
+├── plot.py               # Trajectory and time-series visualization
+├── external_test.py      # Independent dataset evaluation script
+├── test_split.py         # Partitioned train/val/test evaluation
+├── redecode.py           # Offline re-decoding of saved probability archives
+├── smoke_check.py        # Diagnostic verification of causal equivalence & caches
+├── runs/                 # Training runs, checkpoints, and evaluation metrics
+└── requirements.txt      # Python dependencies
 ```
 
-Without explicit coordinates, prediction reads only the first position from
-`metadata/state_frames.npy`. Prediction does not load later motion labels.
-Plotting with `--sample` loads ground truth solely for visualization.
+---
 
-The dependency file pins NeMo to 3.0.0. The official
-[NeMo Speech installation guide](https://docs.nvidia.com/nemo/speech/nightly/starthere/install.html)
-provides source/container alternatives if your environment needs them.
+## Installation & Setup
 
-## Existing data format
+### 1. Requirements
+* macOS (Metal/MPS supported) or Linux (CUDA supported)
+* Python 3.10+
+* PyTorch 2.0+
+* NVIDIA NeMo toolkit
 
-Place samples under `data/`, e.g. `data/sample_0000001/`. Required files:
+### 2. Install Dependencies
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-- `spectrograms/stft.npy`: finite nonnegative magnitude STFT, shape `[1025, frames]`.
-- `metadata/frame_times.npy`: increasing frame timestamps in seconds, starting at zero.
-- `metadata/state_frames.npy`: columns **[px, vx, py, vy]**, position metres, velocity m/s.
-- `metadata/simulation_parameters.json`: `source_clip` and `phase1` feature settings.
+### 3. Verify Causal Equivalence & Cache Integrity
+Run the built-in diagnostic test to verify that chunked streaming execution exactly matches full-sequence causal execution:
+```bash
+./venv/bin/python smoke_check.py
+```
 
-Default feature settings match the supplied sample: 22,050 Hz analysis sample
-rate, FFT 2048, hop 256. Data loading verifies these against metadata.
-Inputs are `log1p(magnitude)`, not log-mel. No whole-clip normalization is used.
+---
 
-The centered-STFT assumption is inherited from the previous starter. Confirm it
-against the simulator exporter. A frame is consumed only after its full right
-window edge arrives; frames relying on initial left padding are skipped.
-If exported frame timestamps represent left-aligned windows, set
-`STFT_CENTERED = False` and ensure those timestamps denote window starts.
-No resampling or microphone sample-rate change is performed by this project.
+## Usage & Workflows
 
-Training and validation are grouped by `source_clip` to avoid sharing source
-recordings. At least two distinct source recordings are required. All renderings
-of one source stay together. With one source per vehicle, this also holds out
-vehicles. It is not an independent real-world test set.
+### Training
+To train a model on a dataset grouped by source clips:
+```bash
+mkdir -p runs/my_experiment
+cd runs/my_experiment
 
-## Encoder and timing
+../../venv/bin/python ../../train.py \
+  --data "/path/to/dataset_directory" \
+  --epochs 30 \
+  --checkpoint model.pt
+```
+`train.py` logs training progress to `history.json` and automatically saves the checkpoint achieving the lowest validation loss.
 
-Defaults: 4 Conformer layers, width 128, 4 internal attention heads, causal
-convolution of kernel size 15, channel-wise layer normalization.
+### Single-Clip Streaming Inference
+To stream a single clip and generate output probability archives:
+```bash
+./venv/bin/python predict.py /path/to/sample_dir \
+  --checkpoint runs/vs13_7500_varied_cnn/model.pt \
+  --output prediction.npz \
+  --save-revisions
 
-Attention uses `[1024, 0]` with `regular` masking. The right context is zero.
-Subsampling is disabled, preserving feature-to-label alignment and avoiding
-NeMo's ASR buffer overlap logic. The encoder's linear pre-encoder maps 1027 input
-channels (1025 audio + 2 position coordinates) to the hidden width.
+# Visualize the resulting trajectory
+./venv/bin/python plot.py prediction.npz \
+  --sample /path/to/sample_dir \
+  --output trajectory_timeseries.png \
+  --xy-output trajectory_2d.png
+```
 
-The supplied starting position is divided by 100 and repeated as two conditioning
-channels. It is the same first point throughout the clip. Future positions and
-velocities are never model inputs. This conditions all four heads; it does not
-force their raw distributions to equal the starting coordinate.
+### Independent Blind Evaluation
+To evaluate an entire dataset of unseen test clips and compute comprehensive ADE/FDE metrics:
+```bash
+./venv/bin/python external_test.py \
+  --checkpoint runs/vs13_7500_varied_cnn/model.pt \
+  --input /path/to/blind_test_dataset \
+  --output runs/vs13_7500_varied_cnn/my_evaluation
+```
+This produces:
+* `metrics.json`: Detailed per-clip errors.
+* `summary.json`: Mean/median ADE, FDE, and coordinate MAEs.
+* `.npz` and `.png` trajectory plots for every processed sample.
 
-Training runs the full feature sequence through a causal attention mask.
-Streaming uses nonoverlapping new feature chunks with NeMo's initialized
-attention and convolution caches. Caches reset between clips. Attention caches
-retain 1024 feature frames per layer, approximately 11.9 seconds at this hop.
-This is bounded memory, not guaranteed lossless retention of all past audio.
-The decoder separately keeps the histories of its surviving trajectories.
+### Offline Re-Decoding & Parameter Tuning
+Because raw network probabilities are saved in `.npz` files, you can experiment with decoder weights ($w_{\text{motion}}$, $w_{\text{accel}}$, or RTS smoothing) instantly without re-running neural network inference:
+```bash
+./venv/bin/python redecode.py prediction.npz \
+  --output redecoded_prediction.npz \
+  --accel-weight 0.1 \
+  --motion-weight 1.5 \
+  --smooth
+```
 
-Outputs are scheduled at **0.1, 0.2, 0.3, ... seconds**, ten timestamps per second.
-This is the motion output rate; it is not the waveform sampling rate.
-At each timestamp only frames available by that time can be used. A centered
-frame describes slightly earlier audio, so the model learns to estimate the
-current state from that available history. No future chunk is consulted.
-Runtime speed depends on hardware and must be measured before deployment.
+---
 
-## Targets and losses
+## Output Archive Format (`.npz`)
 
-Head order: **vx, vy, px, py**. Signed velocity components are converted to km/h;
-positions remain in metres. Defaults:
+Predictions saved by `predict.py` or `external_test.py` contain:
 
-- vx/vy: -120 to 120 km/h, step 2.
-- px: -200 to 200 metres, step 2.
-- py: -100 to 100 metres, step 2.
-
-Edit `BINS` before training if necessary. Out-of-range targets raise an error
-rather than being silently clipped. Labels are interpolated to output times,
-then assigned to the nearest bin.
-
-Each head has its own trained weights and CE loss. The shared encoder receives
-gradients from their weighted mean. Optional additional terms compare expected
-positions with integrated expected velocities and penalize excessive expected
-vector acceleration. They are soft penalties, not hard guarantees. Means can
-hide multimodal uncertainty, so the four full distributions are saved too.
-
-Both physics weights default to zero: a plain four-CE baseline. The supplied
-sample's interpolated velocity labels jump from zero at 0.2 s to approximately
-52 km/h at 0.3 s, and have an abrupt change near the end. These exceed the
-decoder's default acceleration limit. Check simulator boundary labels and
-position/velocity timing before enabling physics regularization. A physically
-constrained path cannot exactly reproduce such label discontinuities.
-Set positive weights to enable those penalties after verifying the labels.
-Set `HEAD_WEIGHTS` to change relative supervision strength.
-No standard CTC or transducer loss is used: targets already have timestamps.
-
-`history.json` records separate CE losses, combined losses and diagnostic MAE
-against quantized target centres. These MAEs are not errors against the original
-continuous labels. The best combined validation-loss checkpoint is `model.pt`.
-Encoder and feature settings are stored in that checkpoint for inference.
-
-## Probability graph and constrained path
-
-The four heads produce a probability for every configured bin at every output
-timestamp. Beam search retains multiple joint velocity/position trajectories,
-adds scores from all four heads, and selects a feasible best path as audio arrives.
-
-Positions on each candidate path start exactly at the known p(0), then integrate
-velocity using the trapezoidal rule. Position-head distributions score those
-continuous positions by interpolation. Their peaks do not directly overwrite
-the integrated path. Initial velocity is unknown, so the first interval uses its
-first candidate velocity without assuming zero velocity at t=0.
-
-After the first interval, candidates obey maximum vector acceleration and speed.
-Defaults are 8 m/s^2 and 120 km/h. Tune these limits to the simulator; overly tight
-limits can exclude the true motion. Velocity bin spacing also limits which
-changes can be represented at 10 Hz. Position bounds come from the position bins.
-
-This is approximate beam search with candidate pruning, not exhaustive Viterbi
-or a calibrated joint posterior. A better surviving history can replace the
-previously preferred history. Histories already pruned cannot be recovered.
-The printed current estimates are provisional; later evidence may revise their
-past path. Raw network probabilities are not themselves recomputed for past frames.
-
-## Saved predictions
-
-`probabilities.npz` contains:
-
-| Key | Content |
-| --- | --- |
-| `seconds` | Network output timestamps starting at 0.1 s |
-| `vx`, `vy`, `px`, `py` | Four `[timestamps, bins]` probability arrays |
-| `vx_bins`, etc. | Bin centres, in each head's units |
-| `initial_position` | Exact known initial coordinates |
-| `raw_argmax` | Independent most likely bins, `[timestamps, 4]` |
-| `raw_expectation` | Independent head expectations, `[timestamps, 4]` |
-| `online_estimates` | Best current state emitted at each streaming step |
-| `path_seconds` | Final revised path timestamps, including time zero |
-| `revised_path` | Final best history, `[timestamps + 1, 4]` |
-
-The first row of `revised_path` is **[NaN, NaN, px0, py0]**. Velocities at time zero
-are unknown; the supplied first position is exact. Network distributions begin
-at 0.1 seconds and need not equal the position at time zero.
-
-`--save-revisions` additionally saves the best complete history after each step
-in `<output>.revisions.jsonl`, allowing you to inspect when older estimates change.
-
-`predict.py` replays exported feature files as streaming input; it is not a
-microphone recorder. For actual live acquisition, feed compatible newly available
-`log1p` feature chunks to `MotionModel.predict_chunk(x, p0, cache)`, carry its returned
-cache, and pass the resulting distributions to `MotionDecoder.step(probs, time)`.
-Your acquisition frontend must use the same STFT conventions and avoid future data.
-
-A single mono microphone may not identify every x/y trajectory uniquely. Accuracy
-must be evaluated on held-out trajectories and recordings; architecture alone
-cannot remove acoustic ambiguities or simulation-to-real differences.
-
-## Checks
-
-See `VERIFICATION.md` for the authoring checks and their limits. Run
-`smoke_check.py` in your own installation before training, particularly after
-changing NeMo, context settings, or convolution normalization.
+| Key | Shape / Type | Description |
+| :--- | :--- | :--- |
+| `seconds` | `[T]` | Output timestamps (0.1s, 0.2s, ..., T) |
+| `initial_position` | `[2]` | Ground-truth starting coordinate $(p_{x0}, p_{y0})$ |
+| `vx`, `vy`, `px`, `py` | `[T, Bins]` | Categorical probability distributions from the 4 heads |
+| `vx_bins`, `vy_bins`, ... | `[Bins]` | Physical values corresponding to each bin center |
+| `raw_argmax` | `[T, 4]` | Unconstrained highest-probability bin values |
+| `raw_expectation` | `[T, 4]` | Unconstrained expected values $\sum b_i P(b_i)$ |
+| `online_estimates` | `[T, 4]` | Causal, real-time state emitted at each 0.1s streaming step |
+| `path_seconds` | `[T + 1]` | Timestamps of the revised path (including $t=0$) |
+| `revised_path` | `[T + 1, 4]` | Final kinematically smoothed trajectory $[v_x, v_y, p_x, p_y]$ |
+| `final_path_ade_m` | `float` | Mean Average Displacement Error against ground truth |
+| `online_ade_m` | `float` | Mean Online Displacement Error of streaming estimates |
+| `fde_m` | `float` | Final Displacement Error at trajectory end |

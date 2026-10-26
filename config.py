@@ -12,13 +12,12 @@ SPEC_SR = 22050
 N_FFT = 2048
 HOP = 256
 FEATURES = N_FFT // 2 + 1
-# Existing exported STFT is assumed centered; frames are delayed until available.
 STFT_CENTERED = True
 
 HIDDEN = 128
 LAYERS = 4
 ATTENTION_HEADS = 4
-LEFT_CONTEXT = 1024  # Feature frames per layer, about 11.9 s at this STFT hop.
+LEFT_CONTEXT = 1024
 CONV_KERNEL = 15
 POSITION_SCALE = 100.0
 DROPOUT = 0.1
@@ -27,23 +26,25 @@ LR = 3e-4
 WEIGHT_DECAY = 1e-4
 SEED = 42
 HEAD_WEIGHTS = (1.0, 1.0, 1.0, 1.0)
-# Enable after verifying physically consistent labels (the supplied sample has
-# abrupt velocity boundary changes). Four-head CE is the default baseline.
 KINEMATIC_WEIGHT = 0.0
 ACCELERATION_WEIGHT = 0.0
-MAX_ACCEL_MPS2 = 8.0  # Tune to the simulator; vector acceleration, not per axis.
+MAX_ACCEL_MPS2 = 8.0
 MAX_SPEED_KMPH = 120.0
 BEAM_SIZE = 32
 INITIAL_TOP_K = 8
 BRANCH_TOP_K = 3
 DECODER_ACCEL_PENALTY = 0.1
+DECODER_MOTION_WEIGHT = 1.5
+
+
+FRONTEND = 'frequency_cnn'
 
 
 def model_config():
     return dict(feat_in=FEATURES, hidden=HIDDEN, layers=LAYERS,
                 attention_heads=ATTENTION_HEADS, left_context=LEFT_CONTEXT,
                 conv_kernel=CONV_KERNEL, position_scale=POSITION_SCALE,
-                dropout=DROPOUT)
+                dropout=DROPOUT, frontend=FRONTEND)
 
 
 def feature_config():

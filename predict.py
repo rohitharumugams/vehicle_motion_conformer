@@ -22,13 +22,12 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
     if ckpt.get('architecture') != 'nemo_conformer_motion_v1':
-        raise ValueError('This model needs a NEW Conformer checkpoint; retrain first')
+        raise ValueError('This model needs a v1 Conformer checkpoint')
     model = MotionModel(ckpt['bins'], ckpt['model_config']).to(device)
     model.load_state_dict(ckpt['model'])
     model.eval()
     bins = [np.asarray(b, dtype=np.float32) for b in ckpt['bins']]
     x, ix, seconds = load_audio(args.sample, ckpt['feature_config'])
-    # Reads no future motion labels. Explicit px/py avoids state-file input entirely.
     p0 = (np.array([args.px, args.py], dtype=np.float32) if args.px is not None
           else initial_position(args.sample, ckpt['state_file']))
     position_input = torch.from_numpy(p0)[None].to(device)
@@ -42,7 +41,6 @@ def main():
             logits, cache = model.predict_chunk(chunk, position_input, cache)
             last_probs = [z[0, -1].softmax(-1).cpu().numpy() for z in logits]
             start = int(end) + 1
-        # If no new feature arrived, keep the most recent acoustic distributions.
         if last_probs is None:
             raise RuntimeError('No acoustic prediction available yet')
         for name, prob in zip(NAMES, last_probs):
@@ -51,11 +49,13 @@ def main():
         means.append([float(b @ p) for b, p in zip(bins, last_probs)])
         state = decoder.step(last_probs, second)
         online.append(state)
-        print(f'{second:.1f}s: ' + ' '.join(f'{name}={v:.2f}' for name, v in zip(NAMES, state)))
+        print(f'{second:.1f}s: ' + ' '.join(
+            f'{name}={v:.2f}' for name, v in zip(NAMES, state)))
         if args.save_revisions:
             t, path = decoder.best_path()
             revisions.append(dict(time=float(second), seconds=t.tolist(),
-                                  path=[[None if np.isnan(v) else float(v) for v in row] for row in path]))
+                                  path=[[None if np.isnan(v) else float(v) for v in row]
+                                        for row in path]))
     path_seconds, revised_path = decoder.best_path()
     np.savez(args.output, seconds=seconds, initial_position=p0,
              online_estimates=np.asarray(online), raw_argmax=np.asarray(raw),
