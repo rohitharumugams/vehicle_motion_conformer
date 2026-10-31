@@ -1,13 +1,28 @@
 import torch
 import torch.nn.functional as F
 from config import (HEAD_WEIGHTS, KINEMATIC_WEIGHT, ACCELERATION_WEIGHT,
-                    MAX_ACCEL_MPS2)
+                    MAX_ACCEL_MPS2, LABEL_SMOOTHING_SIGMA)
+
+
+def gaussian_soft_target(target_indices, num_classes, sigma=1.0, device='cpu'):
+    """Generate Gaussian-smoothed probability targets over discrete ordinal classes."""
+    classes = torch.arange(num_classes, device=device, dtype=torch.float32)
+    dist_sq = (classes[None, :] - target_indices[:, None].float()) ** 2
+    return F.softmax(-dist_sq / (2.0 * max(float(sigma), 0.1) ** 2), dim=-1)
 
 
 def motion_loss(logits, target, bins, seconds, p0,
-                kinematic_weight=KINEMATIC_WEIGHT, acceleration_weight=ACCELERATION_WEIGHT):
-    """Four categorical CE losses plus optional soft physics penalties."""
-    ce = torch.stack([F.cross_entropy(z, target[:, j]) for j, z in enumerate(logits)])
+                kinematic_weight=KINEMATIC_WEIGHT, acceleration_weight=ACCELERATION_WEIGHT,
+                label_smoothing_sigma=LABEL_SMOOTHING_SIGMA):
+    """Four categorical CE losses (with Gaussian soft targets) plus soft physics penalties."""
+    ce_losses = []
+    for j, z in enumerate(logits):
+        if label_smoothing_sigma is not None and label_smoothing_sigma > 0:
+            soft_target = gaussian_soft_target(target[:, j], z.shape[-1], sigma=label_smoothing_sigma, device=z.device)
+            ce_losses.append(F.cross_entropy(z, soft_target))
+        else:
+            ce_losses.append(F.cross_entropy(z, target[:, j]))
+    ce = torch.stack(ce_losses)
     weights = ce.new_tensor(HEAD_WEIGHTS)
     total = (ce * weights).sum() / weights.sum()
     means = torch.stack([(z.softmax(-1) * b).sum(-1) for z, b in zip(logits, bins)], -1)

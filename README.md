@@ -159,26 +159,30 @@ Located in `decoder.py` (`MotionDecoder`), this module turns raw probabilities i
 ## Latest Benchmark Metrics
 
 ### Independent 1,000-Clip Blind Test (`vs13_path2d_1000_varied`)
-Evaluated using the latest checkpoint (`runs/vs13_7500_varied_cnn/model.pt`):
+Evaluated using the latest checkpoint (`runs/vs13_7500_varied_improved/model.pt`):
 
 | Evaluation Metric | Score | Unit | Description |
 | :--- | :---: | :---: | :--- |
-| **Final Path ADE (Primary)** | **2.965** | meters | Mean Average Displacement Error of smoothed path |
-| **Median Clip ADE** | **2.612** | meters | Median ADE across all 1,000 test clips |
-| **Online Streaming ADE** | **3.013** | meters | Real-time causal state estimate error at each step |
-| **Final Displacement Error (FDE)** | **7.333** | meters | Positional error at trajectory termination |
-| **X MAE ($p_x$)** | **1.385** | meters | Lateral position mean absolute error |
-| **Y MAE ($p_y$)** | **2.301** | meters | Longitudinal position mean absolute error |
+| **Final Path ADE (Primary)** | **2.806** | meters | Mean Average Displacement Error of smoothed path |
+| **Median Clip ADE** | **2.422** | meters | Median ADE across all 1,000 test clips |
+| **Online Streaming ADE** | **2.821** | meters | Real-time causal state estimate error at each step |
+| **Final Displacement Error (FDE)** | **7.623** | meters | Positional error at trajectory termination |
+| **X MAE ($p_x$)** | **1.525** | meters | Lateral position mean absolute error |
+| **Y MAE ($p_y$)** | **1.988** | meters | Longitudinal position mean absolute error |
 
-### Model Progression Comparison
+### All Runs — Blind Test Results
 
-| Run / Architecture | Dataset Size | Frontend | Best Val Loss | Blind Test ADE | Online ADE | FDE |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`vs13_7500_varied_cnn`** (Latest) | 7,500 clips | **Frequency CNN** | **1.8173** | **2.965 m** | **3.013 m** | **7.333 m** |
-| `vs13_7500_varied_v1` | 7,500 clips | Linear | 1.8318 | 3.043 m | 3.093 m | 7.748 m |
-| `vs13_1000_option_a_cnn` | 1,000 clips | Frequency CNN | 2.5020 | 4.158 m | 4.194 m | 10.070 m |
-| `vs13_1000_option_a` | 1,000 clips | Linear | 2.5397 | 5.047 m | 5.102 m | 11.009 m |
-| Original `model.pt` baseline | 1,000 clips | Linear | 2.8428 | — | — | — |
+| Run | Dataset | Training Changes | Best Val Loss | ADE ↓ | Median ADE ↓ | Online ADE ↓ | FDE ↓ | X MAE ↓ | Y MAE ↓ |
+| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`vs13_7500_varied_improved`** 🏆 | 7,500 clips | + Soft labels, kinematic loss, SpecAugment | 2.1622† | **2.806 m** | **2.422 m** | **2.821 m** | 7.623 m | 1.525 m | **1.988 m** |
+| `vs13_7500_varied_cnn` | 7,500 clips | + Frequency CNN frontend | **1.8173** | 2.965 m | 2.612 m | 3.013 m | **7.333 m** | **1.385 m** | 2.301 m |
+| `vs13_7500_varied_v1` | 7,500 clips | Baseline (linear projection) | 1.9416 | 3.043 m | — | 3.093 m | 7.748 m | — | — |
+| `smoke_1000` | 1,000 clips | + Soft labels, kinematic loss, SpecAugment | 2.2886† | 4.365 m | 3.775 m | 4.567 m | 9.947 m | 2.679 m | 2.840 m |
+| `vs13_1000_option_a_cnn` | 1,000 clips | + Frequency CNN frontend | 2.1404 | 4.158 m | — | 4.194 m | 10.070 m | — | — |
+| `vs13_1000_option_a` | 1,000 clips | Baseline (linear projection) | 2.1588 | 5.047 m | — | 5.102 m | 11.009 m | — | — |
+| Original baseline | 1,000 clips | — | 2.8428 | — | — | — | — | — | — |
+
+> † Val loss not directly comparable to earlier runs — Gaussian soft-label CE + kinematic loss terms inflate the absolute loss value.
 
 ---
 

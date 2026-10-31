@@ -35,6 +35,38 @@ class FrequencyCNN(nn.Module):
         return embeddings.reshape(batch, time, -1)
 
 
+class SpectroTemporalCNN(nn.Module):
+    """2D spectro-temporal convolutions capturing Doppler rate of change across time and frequency."""
+
+    def __init__(self, n_freq=1025, embedding_dim=128, dropout=0.1):
+        super().__init__()
+        import torch.nn.functional as F
+        self._pad = F.pad
+        self.conv1 = nn.Conv2d(1, 8, kernel_size=(3, 5), stride=(1, 2), padding=0)
+        self.act1 = nn.GELU()
+        self.conv2 = nn.Conv2d(8, 16, kernel_size=(3, 5), stride=(1, 2), padding=0)
+        self.act2 = nn.GELU()
+
+        reduced_freq = (n_freq + 2 * 2 - 5) // 2 + 1
+        reduced_freq = (reduced_freq + 2 * 2 - 5) // 2 + 1
+
+        self.projection = nn.Sequential(
+            nn.Linear(16 * reduced_freq, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # Causal left padding in time: left=2, right=0; symmetric padding in frequency: left=2, right=2
+        out = self._pad(x.unsqueeze(1), (2, 2, 2, 0))
+        out = self.act1(self.conv1(out))
+        out = self._pad(out, (2, 2, 2, 0))
+        out = self.act2(self.conv2(out))
+        B, C, T, F_red = out.shape
+        out = out.permute(0, 2, 1, 3).reshape(B, T, C * F_red)
+        return self.projection(out)
+
+
 class MotionModel(nn.Module):
     """Optional frequency CNN + causal Conformer + four categorical heads."""
 
@@ -45,14 +77,17 @@ class MotionModel(nn.Module):
             # New training runs use the CNN frontend.
             self.settings = dict(model_config())
             self.settings.setdefault("frontend", "frequency_cnn")
+            self.settings.setdefault("spatial_conditioning", "concat")
         else:
             # Old checkpoints without this field retain the original model.
             self.settings = dict(settings)
             self.settings.setdefault("frontend", "linear")
+            self.settings.setdefault("spatial_conditioning", "concat")
 
         c = self.settings
         self.feat_in = c["feat_in"]
         self.position_scale = c["position_scale"]
+        self.spatial_conditioning = c["spatial_conditioning"]
 
         bins = BINS if bins is None else bins
         for j, b in enumerate(bins):
@@ -67,12 +102,30 @@ class MotionModel(nn.Module):
                 embedding_dim=c["hidden"],
                 dropout=c["dropout"],
             )
-            encoder_feat_in = c["hidden"] + 2
+            raw_feat_dim = c["hidden"]
+        elif c["frontend"] == "spectro_temporal_cnn":
+            self.frontend = SpectroTemporalCNN(
+                n_freq=self.feat_in,
+                embedding_dim=c["hidden"],
+                dropout=c["dropout"],
+            )
+            raw_feat_dim = c["hidden"]
         elif c["frontend"] == "linear":
             self.frontend = nn.Identity()
-            encoder_feat_in = self.feat_in + 2
+            raw_feat_dim = self.feat_in
         else:
             raise ValueError(f"Unknown frontend: {c['frontend']}")
+
+        if self.spatial_conditioning == "film":
+            self.film_gen = nn.Sequential(
+                nn.Linear(2, 64),
+                nn.GELU(),
+                nn.Linear(64, 2 * raw_feat_dim),
+            )
+            encoder_feat_in = raw_feat_dim
+        else:
+            self.film_gen = None
+            encoder_feat_in = raw_feat_dim + 2
 
         self.encoder = ConformerEncoder(
             feat_in=encoder_feat_in,
@@ -120,15 +173,21 @@ class MotionModel(nn.Module):
 
         spectral_features = self.frontend(x)
 
-        context = (
-            (p0.to(x) / self.position_scale)
-            .unsqueeze(1)
-            .expand(-1, x.shape[1], -1)
-        )
-
-        features = torch.cat(
-            (spectral_features, context), dim=-1
-        ).transpose(1, 2)
+        if self.spatial_conditioning == "film":
+            norm_p0 = p0.to(x) / self.position_scale
+            film_weights = self.film_gen(norm_p0)
+            gamma, beta = torch.chunk(film_weights, 2, dim=-1)
+            conditioned_features = (1.0 + gamma.unsqueeze(1)) * spectral_features + beta.unsqueeze(1)
+            features = conditioned_features.transpose(1, 2)
+        else:
+            context = (
+                (p0.to(x) / self.position_scale)
+                .unsqueeze(1)
+                .expand(-1, x.shape[1], -1)
+            )
+            features = torch.cat(
+                (spectral_features, context), dim=-1
+            ).transpose(1, 2)
 
         lengths = torch.full(
             (x.shape[0],),

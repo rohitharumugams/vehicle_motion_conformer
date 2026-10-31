@@ -54,13 +54,31 @@ def main():
             probs[j][np.abs(b - value).argmin()] = 1
         state = decoder.step(probs, (n + 1) / 10)
         assert np.isfinite(state).all()
+    t_smooth, path_smooth = decoder.best_path(adaptive_noise=True)
+    assert len(t_smooth) == 6 and np.isfinite(path_smooth).all()
+
+    # Verify SpectroTemporalCNN and FiLM conditioning
+    c_film = dict(c, frontend='spectro_temporal_cnn', spatial_conditioning='film')
+    m_film = MotionModel(settings=c_film).train()
+    out_film, _ = m_film(x[:, :15], p0)
+    loss_film = sum(z.sum() for z in out_film)
+    loss_film.backward()
+    assert m_film.film_gen[0].weight.grad is not None
+
+    # Verify Data Augmentations
+    from data import spec_augment, add_acoustic_noise
+    spec_sample = np.ones((50, c['feat_in']), dtype=np.float32)
+    aug1 = spec_augment(spec_sample)
+    aug2 = add_acoustic_noise(spec_sample)
+    assert aug1.shape == aug2.shape == spec_sample.shape and np.isfinite(aug1).all()
+
     if args.sample:
         from data import load
         features, y, ix, seconds, start = load(args.sample)
         assert features.shape[1] == c['feat_in']
         assert len(y) == len(ix) == len(seconds) and ix[-1] < len(features)
         print(f'Sample OK: {len(features)} features, {len(seconds)} outputs, p0={start}')
-    print('PASS: causal outputs, streaming/full equivalence, four-head gradients, and decoder')
+    print('PASS: causal outputs, streaming/full equivalence, four-head gradients, 2D CNN, FiLM, augmentations, and adaptive decoder')
 
 
 if __name__ == '__main__':

@@ -10,7 +10,7 @@ from loss import motion_loss
 from model import MotionModel
 
 
-def prefetch_loader(path_list, max_prefetch=4):
+def prefetch_loader(path_list, max_prefetch=4, augment=False):
     """Prefetch samples in a background thread so disk I/O overlaps with GPU compute."""
     from queue import Queue
     from threading import Thread
@@ -21,7 +21,7 @@ def prefetch_loader(path_list, max_prefetch=4):
     def worker():
         for p in path_list:
             try:
-                data = load(p)
+                data = load(p, augment=augment)
                 q.put((p, data, None))
             except Exception as e:
                 q.put((p, None, e))
@@ -87,7 +87,7 @@ def main():
             with torch.set_grad_enabled(training):
                 phase = 'train' if training else 'val'
                 for p, (x, y, ix, seconds, p0) in tqdm(
-                    prefetch_loader(paths), total=len(paths),
+                    prefetch_loader(paths, augment=training), total=len(paths),
                     desc=f'epoch {epoch + 1}/{args.epochs} {phase}',
                     unit='clip', leave=False
                 ):
@@ -127,7 +127,8 @@ def main():
                               epoch=epoch + 1, val_loss=best, split=partition,
                               loss_settings=dict(head_weights=list(C.HEAD_WEIGHTS),
                                                  kinematic_weight=C.KINEMATIC_WEIGHT,
-                                                 acceleration_weight=C.ACCELERATION_WEIGHT))
+                                                 acceleration_weight=C.ACCELERATION_WEIGHT,
+                                                 label_smoothing_sigma=C.LABEL_SMOOTHING_SIGMA))
             torch.save(checkpoint, ckpt_path)
 
 

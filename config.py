@@ -26,8 +26,9 @@ LR = 3e-4
 WEIGHT_DECAY = 1e-4
 SEED = 42
 HEAD_WEIGHTS = (1.0, 1.0, 1.0, 1.0)
-KINEMATIC_WEIGHT = 0.0
-ACCELERATION_WEIGHT = 0.0
+KINEMATIC_WEIGHT = 0.05
+ACCELERATION_WEIGHT = 0.01
+LABEL_SMOOTHING_SIGMA = 1.0
 MAX_ACCEL_MPS2 = 8.0
 MAX_SPEED_KMPH = 120.0
 BEAM_SIZE = 32
@@ -36,15 +37,17 @@ BRANCH_TOP_K = 3
 DECODER_ACCEL_PENALTY = 0.1
 DECODER_MOTION_WEIGHT = 1.5
 
-
 FRONTEND = 'frequency_cnn'
+SPATIAL_CONDITIONING = 'concat'
+AUGMENT_SPEC = True
 
 
 def model_config():
     return dict(feat_in=FEATURES, hidden=HIDDEN, layers=LAYERS,
                 attention_heads=ATTENTION_HEADS, left_context=LEFT_CONTEXT,
                 conv_kernel=CONV_KERNEL, position_scale=POSITION_SCALE,
-                dropout=DROPOUT, frontend=FRONTEND)
+                dropout=DROPOUT, frontend=FRONTEND,
+                spatial_conditioning=SPATIAL_CONDITIONING)
 
 
 def feature_config():

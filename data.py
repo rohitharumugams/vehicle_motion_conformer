@@ -48,9 +48,43 @@ def initial_position(path, state_file=STATE):
     return p0
 
 
-def load(path, bins=BINS):
+def spec_augment(x, freq_mask_param=24, time_mask_param=16, n_freq_masks=2, n_time_masks=2, rng=None):
+    """SpecAugment on log-STFT features [T, F] without modifying original array in-place."""
+    if rng is None:
+        rng = np.random.default_rng()
+    x_aug = x.copy()
+    T, F = x_aug.shape
+    for _ in range(n_freq_masks):
+        f = rng.integers(0, freq_mask_param + 1)
+        if f > 0 and F > f:
+            f0 = rng.integers(0, F - f)
+            x_aug[:, f0:f0 + f] = 0.0
+    for _ in range(n_time_masks):
+        t = rng.integers(0, time_mask_param + 1)
+        if t > 0 and T > t:
+            t0 = rng.integers(0, T - t)
+            x_aug[t0:t0 + t, :] = 0.0
+    return x_aug
+
+
+def add_acoustic_noise(x, noise_level=0.02, rng=None):
+    """Add small random acoustic background noise to log-STFT features."""
+    if rng is None:
+        rng = np.random.default_rng()
+    noise = rng.normal(0.0, noise_level, size=x.shape).astype(np.float32)
+    return np.maximum(x + noise, 0.0)
+
+
+def load(path, bins=BINS, augment=False, rng=None):
     p = Path(path)
     x, ix, seconds = load_audio(p)
+    if augment:
+        if rng is None:
+            rng = np.random.default_rng()
+        if rng.random() < 0.8:
+            x = spec_augment(x, rng=rng)
+        if rng.random() < 0.5:
+            x = add_acoustic_noise(x, rng=rng)
     t = np.load(p / 'metadata/frame_times.npy')
     s = np.load(p / 'metadata' / STATE)
     if s.shape != (len(t), 4) or not np.isfinite(s).all():

@@ -16,18 +16,23 @@ def huber(x):
     return np.where(x <= 1, 0.5 * x ** 2, x - 0.5)
 
 
-def rts_smooth_path(times, states, q_accel=3.0, r_pos=1.5, r_vel=2.0):
+def rts_smooth_path(times, states, q_accel=3.0, r_pos=1.5, r_vel=2.0,
+                    measurement_stds=None, min_r_pos=0.5, min_r_vel=1.0):
     """Rauch-Tung-Striebel (RTS) Kalman smoother for vehicle trajectories.
 
     Eliminates discrete quantization steps and produces kinematically smooth,
-    continuous paths adhering to vehicle dynamics.
+    continuous paths adhering to vehicle dynamics. Supports adaptive measurement
+    covariance based on categorical observation standard deviations.
     
     Args:
         times: (T,) array of timestamps in seconds.
         states: (T, 4) array of [vx_kmph, vy_kmph, px_m, py_m].
         q_accel: Process noise acceleration std in m/s^2.
-        r_pos: Measurement noise position std in meters.
-        r_vel: Measurement noise velocity std in km/h.
+        r_pos: Base measurement noise position std in meters.
+        r_vel: Base measurement noise velocity std in km/h.
+        measurement_stds: Optional (T, 4) array of observation stds for adaptive noise.
+        min_r_pos: Minimum allowable measurement position std in meters.
+        min_r_vel: Minimum allowable measurement velocity std in km/h.
     Returns:
         smoothed_states: (T, 4) array of smoothed states.
     """
@@ -74,7 +79,16 @@ def rts_smooth_path(times, states, q_accel=3.0, r_pos=1.5, r_vel=2.0):
         v_y_mps = states[k, 1] / 3.6 if not np.isnan(states[k, 1]) else 0.0
         z = np.array([states[k, 2], states[k, 3], v_x_mps, v_y_mps], dtype=np.float64)
         H = np.eye(4, dtype=np.float64)
-        R = np.diag([r_pos**2, r_pos**2, (r_vel / 3.6)**2, (r_vel / 3.6)**2])
+
+        if measurement_stds is not None and k < len(measurement_stds):
+            s = measurement_stds[k]
+            r_px = max(float(s[2]), min_r_pos)
+            r_py = max(float(s[3]), min_r_pos)
+            r_vx = max(float(s[0]) / 3.6, min_r_vel / 3.6)
+            r_vy = max(float(s[1]) / 3.6, min_r_vel / 3.6)
+            R = np.diag([r_px**2, r_py**2, r_vx**2, r_vy**2])
+        else:
+            R = np.diag([r_pos**2, r_pos**2, (r_vel / 3.6)**2, (r_vel / 3.6)**2])
 
         # Innovation and update
         y = z - H @ x_pred
@@ -140,18 +154,24 @@ class MotionDecoder:
         self.position_scale = position_scale
         self.smooth_rts = smooth_rts
         self.beam = [Node(0.0, np.r_[np.nan, np.nan, p0], 0.0)]
+        self.history_stds = [np.array([0.0, 0.0, 0.01, 0.01], dtype=np.float64)]
 
     def step(self, probabilities, time):
         if len(probabilities) != 4 or not np.isfinite(time) or time <= self.beam[0].time:
             raise ValueError('Need four distributions and a strictly increasing finite timestamp')
-        probs, means = [], []
+        probs, means, stds = [], [], []
         for p, b in zip(probabilities, self.bins):
             p = np.asarray(p, dtype=np.float64)
             if p.shape != b.shape or not np.isfinite(p).all() or np.any(p < 0) or p.sum() <= 0:
                 raise ValueError('Invalid categorical probabilities')
             p = p / p.sum()
             probs.append(p)
-            means.append(float(b @ p))
+            mu = float(b @ p)
+            means.append(mu)
+            var = float(np.sum((b - mu) ** 2 * p))
+            stds.append(np.sqrt(max(var, 0.01)))
+
+        self.history_stds.append(np.array(stds, dtype=np.float64))
 
         dt = float(time) - self.beam[0].time
         # Continuous position observation from expectation
@@ -236,7 +256,7 @@ class MotionDecoder:
                      for i in chosen]
         return self.beam[0].state.copy()
 
-    def best_path(self, smooth=None):
+    def best_path(self, smooth=None, adaptive_noise=True, q_accel=3.0, r_pos=1.5, r_vel=2.0):
         """Retrieve the best-scoring trajectory, optionally smoothed with RTS Kalman filter."""
         if smooth is None:
             smooth = self.smooth_rts
@@ -248,7 +268,11 @@ class MotionDecoder:
         times = np.array([n.time for n in nodes])
         states = np.stack([n.state for n in nodes])
         if smooth and len(states) >= 3:
-            states = rts_smooth_path(times, states)
+            meas_stds = None
+            if adaptive_noise and hasattr(self, 'history_stds') and len(self.history_stds) == len(states):
+                meas_stds = np.array(self.history_stds)
+            states = rts_smooth_path(times, states, q_accel=q_accel, r_pos=r_pos, r_vel=r_vel,
+                                    measurement_stds=meas_stds)
         return times, states
 
 

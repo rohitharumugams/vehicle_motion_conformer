@@ -57,6 +57,8 @@ def main():
                         help='Directory for NPZ files, plots, and metrics')
     parser.add_argument('--limit', type=int,
                         help='Process only the first N clips for a quick check')
+    parser.add_argument('--no-plots', action='store_true',
+                        help='Skip rendering PNG plots to speed up evaluation')
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error('--limit must be positive')
@@ -97,8 +99,9 @@ def main():
                 key: value for key, value in metrics.items() if key != 'timestamps'
             }
             np.savez(prediction_path, **result, **extra)
-            plot_prediction(prediction_path, output_path / f'{sample.name}.png', sample)
-            plot_xy_prediction(prediction_path, xy_path / f'{sample.name}.png', sample)
+            if not args.no_plots:
+                plot_prediction(prediction_path, output_path / f'{sample.name}.png', sample)
+                plot_xy_prediction(prediction_path, xy_path / f'{sample.name}.png', sample)
             completed.append(str(sample))
             if metrics is not None:
                 clip_metrics.append({'sample': sample.name, **metrics})
