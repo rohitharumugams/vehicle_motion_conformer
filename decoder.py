@@ -122,6 +122,28 @@ def rts_smooth_path(times, states, q_accel=3.0, r_pos=1.5, r_vel=2.0,
     return smoothed
 
 
+def expectation_rts_path(p0, seconds, expectation, q_accel=None, r_pos=None, r_vel=None):
+    """RTS-smooth the per-step head expectations directly (no beam search).
+
+    Args:
+        p0: (2,) known starting position.
+        seconds: (T,) output timestamps (excluding t=0).
+        expectation: (T, 4) per-step [vx_kmph, vy_kmph, px_m, py_m] expectations.
+    Returns:
+        (path_seconds [T+1], path [T+1, 4]) in the same layout as MotionDecoder.best_path().
+    """
+    q_accel = C.EXPECTATION_RTS_Q_ACCEL if q_accel is None else q_accel
+    r_pos = C.EXPECTATION_RTS_R_POS if r_pos is None else r_pos
+    r_vel = C.EXPECTATION_RTS_R_VEL if r_vel is None else r_vel
+    seconds = np.asarray(seconds, dtype=np.float64)
+    expectation = np.asarray(expectation, dtype=np.float64)
+    times = np.r_[0.0, seconds]
+    states = np.vstack([np.r_[np.nan, np.nan, np.asarray(p0, dtype=np.float64)], expectation])
+    if len(states) < 3:
+        return times, states
+    return times, rts_smooth_path(times, states, q_accel=q_accel, r_pos=r_pos, r_vel=r_vel)
+
+
 class MotionDecoder:
     """Continuous-expectation beam search with soft motion consistency and RTS smoothing.
 

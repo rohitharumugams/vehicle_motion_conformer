@@ -154,6 +154,14 @@ class MotionModel(nn.Module):
             nn.Linear(c["hidden"], len(b)) for b in bins
         )
 
+        # Auxiliary direct position regression head: predicts (px, py) in metres.
+        # Used only during training as an extra anchor loss; not used during decoding.
+        self.position_head = nn.Sequential(
+            nn.Linear(c["hidden"], 64),
+            nn.GELU(),
+            nn.Linear(64, 2),
+        )
+
     @property
     def bins(self):
         return [getattr(self, f"bins_{j}") for j in range(4)]
@@ -215,7 +223,7 @@ class MotionModel(nn.Module):
             None if cache is None else (out[2], out[3], out[4])
         )
 
-        return [head(z) for head in self.heads], next_cache
+        return [head(z) for head in self.heads], next_cache, self.position_head(z)
 
     def initial_cache(self, batch_size=1):
         p = next(self.parameters())
@@ -233,4 +241,5 @@ class MotionModel(nn.Module):
             cache = self.initial_cache(x.shape[0])
 
         with torch.inference_mode():
-            return self.forward(x, p0, cache)
+            logits, next_cache, _ = self.forward(x, p0, cache)
+            return logits, next_cache

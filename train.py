@@ -95,9 +95,15 @@ def main():
                     y = torch.from_numpy(y).to(device)
                     ix = torch.from_numpy(ix).to(device)
                     p0 = torch.from_numpy(p0)[None].to(device)
-                    output, _ = model(x, p0)
+                    output, _, pos_pred_full = model(x, p0)
                     logits = [z[0, ix] for z in output]
-                    loss, terms = motion_loss(logits, y, model.bins, seconds, p0[0])
+                    # pos_pred at the sampled timesteps; ground-truth px,py in metres
+                    pos_pred = pos_pred_full[0, ix]          # [T, 2]
+                    gt_position = torch.stack(
+                        [model.bins[2][y[:, 2]], model.bins[3][y[:, 3]]], dim=-1
+                    )                                        # [T, 2]
+                    loss, terms = motion_loss(logits, y, model.bins, seconds, p0[0],
+                                             pos_pred=pos_pred, gt_position=gt_position)
                     if not torch.isfinite(loss):
                         raise RuntimeError(f'Nonfinite loss on {p}')
                     if training:
@@ -128,7 +134,9 @@ def main():
                               loss_settings=dict(head_weights=list(C.HEAD_WEIGHTS),
                                                  kinematic_weight=C.KINEMATIC_WEIGHT,
                                                  acceleration_weight=C.ACCELERATION_WEIGHT,
-                                                 label_smoothing_sigma=C.LABEL_SMOOTHING_SIGMA))
+                                                 label_smoothing_sigma=C.LABEL_SMOOTHING_SIGMA,
+                                                 position_head_weight=C.POSITION_HEAD_WEIGHT,
+                                                 endpoint_weight=C.ENDPOINT_WEIGHT))
             torch.save(checkpoint, ckpt_path)
 
 

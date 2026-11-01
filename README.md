@@ -11,17 +11,19 @@ Real-time 2D vehicle motion estimation (velocities and positions) from single-mi
    - [Acoustic Preprocessing & Spatial Conditioning](#1-acoustic-preprocessing--spatial-conditioning)
    - [Frequency CNN Frontend](#2-frequency-cnn-frontend)
    - [NVIDIA NeMo Conformer Encoder](#3-nvidia-nemo-conformer-encoder)
-   - [Four Categorical Prediction Heads](#4-four-categorical-prediction-heads)
-   - [Kinematic Beam Search & RTS Kalman Decoder](#5-kinematic-beam-search--rts-kalman-decoder)
-4. [Latest Benchmark Metrics](#latest-benchmark-metrics)
-5. [Repository Structure](#repository-structure)
-6. [Installation & Setup](#installation--setup)
-7. [Usage & Workflows](#usage--workflows)
+   - [Categorical Heads & Auxiliary Direct Position Head](#4-categorical-heads--auxiliary-direct-position-head)
+   - [Training Loss & Objectives](#5-training-loss--objectives)
+   - [Decoders: Expectation RTS & Kinematic Beam Search](#6-decoders-expectation-rts--kinematic-beam-search)
+4. [Model Evolution & Milestone History](#model-evolution--milestone-history)
+5. [Latest Benchmark Metrics](#latest-benchmark-metrics)
+6. [Repository Structure](#repository-structure)
+7. [Installation & Setup](#installation--setup)
+8. [Usage & Workflows](#usage--workflows)
    - [Training](#training)
    - [Single-Clip Streaming Inference](#single-clip-streaming-inference)
    - [Independent Blind Evaluation](#independent-blind-evaluation)
    - [Offline Re-Decoding & Parameter Tuning](#offline-re-decoding--parameter-tuning)
-8. [Output Archive Format (`.npz`)](#output-archive-format-npz)
+9. [Output Archive Format (`.npz`)](#output-archive-format-npz)
 
 ---
 
@@ -131,58 +133,103 @@ During streaming execution (`predict_chunk`), the Conformer avoids reprocessing 
 * `cache_last_time`: Caches the sliding convolution receptive field (the 14 previous samples required for kernel-15 causal convolution).
 * `cache_last_channel_len`: Tracks valid cache sequence lengths.
 
-### 4. Four Categorical Prediction Heads
+### 4. Categorical Heads & Auxiliary Direct Position Head
 The shared 128-dim representations from the Conformer feed four parallel classification heads (`nn.Linear(128, len(b))`):
 * **$v_x$ (Lateral Velocity):** $[-120, +120]$ km/h, step 2 km/h (121 bins)
 * **$v_y$ (Longitudinal Velocity):** $[-120, +120]$ km/h, step 2 km/h (121 bins)
 * **$p_x$ (Lateral Position):** $[-200, +200]$ meters, step 2 m (201 bins)
 * **$p_y$ (Longitudinal Position):** $[-100, +100]$ meters, step 2 m (101 bins)
 
-**Why Categorical Classification over Direct Regression?**
+**Auxiliary Direct Position Regression Head (`poshead`):**
+In addition to the 4 categorical heads, an auxiliary 2-layer MLP (`Linear(128 -> 64) -> GELU -> Linear(64 -> 2)`) directly predicts continuous Cartesian coordinates $(\hat{p}_x, \hat{p}_y)$ in meters. Supervised with a Smooth L1 loss during training, it acts as an anchor regularizer preventing mode-collapse drift without compromising categorical inference.
+
+**Why Categorical Classification over Pure Regression?**
 Acoustic pass-bys suffer from multi-modal uncertainty (e.g., symmetry ambiguity where approaching from the front-left can produce similar Doppler pitches as front-right). A standard regression model (MSE loss) collapses to the arithmetic mean of multiple modes, predicting physically impossible paths down the middle. Categorical heads preserve the full multi-modal probability distributions $P(s)$, allowing the downstream kinematic decoder to pick the globally consistent trajectory.
 
-### 5. Kinematic Beam Search & RTS Kalman Decoder
-Located in `decoder.py` (`MotionDecoder`), this module turns raw probabilities into continuous, physically valid vehicle paths.
+### 5. Training Loss & Objectives
+The model optimizes a composite multi-task objective:
+1. **Gaussian Soft-Target Cross Entropy:** Target labels are smoothed over discrete ordinal classes using a Gaussian window ($\sigma = 1.0$) rather than one-hot labels, rewarding predictions that land close to the ground truth bin.
+2. **Endpoint Time-Weighted Ramp:** Loss weights linearly scale from $1.0\times$ at $t=0$ to $3.0\times$ at the final timestamp ($t=T$), heavily penalizing late-trajectory drift and driving down Final Displacement Error (FDE).
+3. **Kinematic & Acceleration Penalties:** Soft physics losses penalize velocity discrepancies ($p - p_{\text{int}}$) and unphysical acceleration ($a > 8\text{ m/s}^2$).
+4. **Auxiliary Position Loss:** Direct Smooth L1 loss on the auxiliary continuous position head.
 
-1. **Continuous Expectation Proposals:** Instead of picking discrete bin centers (which would cause 2-meter staircasing artifacts), position and velocity candidates are proposed using continuous expectations:
-   $$\mu = \sum_{i} b_i \cdot P(b_i)$$
-   Blended convex proposals combine expected observations with trapezoidal velocity integration:
-   $$p_{\text{int}} = p_{t-1} + \frac{v_{t-1} + v_t}{2} \cdot \Delta t$$
-2. **Path Scoring:** Paths are scored using a combination of acoustic probability and physical feasibility:
-   $$\text{Score}_t = \text{Score}_{t-1} + \sum_{j \in \{vx,vy,px,py\}} \ln P(s_j) - w_m \cdot \text{Huber}(p - p_{\text{int}}) - w_a \cdot \text{Huber}(\text{excess } a)$$
-   Candidates exceeding maximum speed ($120$ km/h) or physical acceleration limits ($a > 8\text{ m/s}^2$) are pruned.
-3. **Diverse Beam Pruning:** Retains the top $K=32$ candidate trajectory histories.
-4. **Rauch-Tung-Striebel (RTS) Kalman Smoothing:** Once the highest-scoring beam path is finalized, a backward Kalman smoother passes over the trajectory using a double-integrator kinematic model, eliminating discrete steps and enforcing continuous vehicle dynamics.
+### 6. Decoders: Expectation RTS & Kinematic Beam Search
+Located in `decoder.py`, the pipeline supports two complementary decoders:
+* **Expectation RTS Decoder (Default, High Accuracy):** Takes continuous expectation values ($\mu = \sum b_i P(b_i)$) directly from the model heads, anchors $p_0$ at $t=0$, and applies a Rauch-Tung-Striebel (RTS) Kalman smoother ($q_{\text{accel}}=6.0, r_{\text{pos}}=1.5$). By bypassing beam discretization, it completely eliminates 2-meter staircasing artifacts, lowers ADE to 2.549 m, and drops FDE by 13.4%.
+* **Kinematic Beam Search Decoder (Online Streaming):** Evaluates candidate velocity and position transitions with kinematic pruning ($a \le 8\text{ m/s}^2$), maintaining top-32 candidate paths for strict causal streaming evaluation.
+
+---
+
+## Model Evolution & Milestone History
+
+Here is the step-by-step progression of the project across iterations:
+
+### Milestone 1: Baseline Architecture & Frequency CNN Frontend
+* **Changes:** Replaced naive linear FFT projection with a causal 1D `FrequencyCNN` acting along spectral bins to capture Doppler pitch transitions and harmonic spacing.
+* **Results (`vs13_7500_varied_cnn` vs `vs13_7500_varied_v1`):**
+  * ADE: **3.043 m $\rightarrow$ 2.965 m**
+  * FDE: **7.748 m $\rightarrow$ 7.333 m**
+  * Proved that convolutional inductive bias along frequency improves Doppler shift tracking.
+
+### Milestone 2: Soft Targets, Kinematic Loss & Acoustic Augmentations
+* **Changes:**
+  * **Gaussian Soft Targets ($\sigma=1.0$):** Replaced hard one-hot classification with Gaussian-distributed targets over ordinal bins, penalizing distance from truth rather than binary misclassification.
+  * **Kinematic & Jerk Penalties:** Added differentiable acceleration smoothness penalties during training.
+  * **SpecAugment & Noise:** Random frequency and time masking to prevent spectral overfitting.
+* **Results (`vs13_7500_varied_improved`):**
+  * ADE: **2.965 m $\rightarrow$ 2.806 m** (-5.4% error reduction)
+  * Longitudinal $Y$ MAE: **2.301 m $\rightarrow$ 1.988 m** (-13.6%)
+  * FDE slightly regressed (7.333 m $\rightarrow$ 7.623 m) due to late-clip acoustic signal fading.
+
+### Milestone 3: Auxiliary Position Head (`poshead`) & Endpoint Loss Ramp
+* **Changes:**
+  * **Auxiliary PosHead:** Added a direct 2-layer MLP continuous regression head for Cartesian coordinates $(\hat{p}_x, \hat{p}_y)$ to act as a coordinate anchor.
+  * **Endpoint Loss Weighting:** Applied a linear loss ramp ($1.0\times \rightarrow 3.0\times$) from $t=0$ to $t=T$ to force the network to prioritize trajectory termination and eliminate late drift.
+* **Results (`vs13_7500_varied_poshead` with Beam Search):**
+  * ADE: **2.806 m $\rightarrow$ 2.660 m**
+  * FDE: **7.623 m $\rightarrow$ 7.087 m** (-7.0% improvement, best recorded beam result)
+  * ADE < 2m fraction: Jumped from **30.8% $\rightarrow$ 40.2%** of clips.
+
+### Milestone 4: Expectation RTS Decoder (Eliminating Beam Discretization)
+* **Changes:**
+  * Replaced discrete beam search with continuous head expectations ($\mu = \sum b_i P(b_i)$) feeding directly into a tuned backward RTS Kalman smoother ($q=6.0, r_{\text{pos}}=1.5$).
+  * Completely eliminated discrete 2-meter staircasing artifacts without requiring any model retraining.
+* **Results (`vs13_7500_varied_poshead` with Expectation RTS):**
+  * ADE: **2.660 m $\rightarrow$ 2.549 m** (All-time best, -14.0% vs baseline)
+  * FDE: **7.087 m $\rightarrow$ 6.139 m** (-13.4% drop in endpoint error)
+  * 100% of blind test clips now track within < 10 m ADE.
 
 ---
 
 ## Latest Benchmark Metrics
 
 ### Independent 1,000-Clip Blind Test (`vs13_path2d_1000_varied`)
-Evaluated using the latest checkpoint (`runs/vs13_7500_varied_improved/model.pt`):
+Evaluated using the latest checkpoint (`runs/vs13_7500_varied_poshead/model.pt`) with the **Expectation RTS Decoder**:
 
 | Evaluation Metric | Score | Unit | Description |
 | :--- | :---: | :---: | :--- |
-| **Final Path ADE (Primary)** | **2.806** | meters | Mean Average Displacement Error of smoothed path |
-| **Median Clip ADE** | **2.422** | meters | Median ADE across all 1,000 test clips |
-| **Online Streaming ADE** | **2.821** | meters | Real-time causal state estimate error at each step |
-| **Final Displacement Error (FDE)** | **7.623** | meters | Positional error at trajectory termination |
-| **X MAE ($p_x$)** | **1.525** | meters | Lateral position mean absolute error |
-| **Y MAE ($p_y$)** | **1.988** | meters | Longitudinal position mean absolute error |
+| **Final Path ADE (Primary)** | **2.549** | meters | Mean Average Displacement Error of smoothed path |
+| **Median Clip ADE** | **2.251** | meters | Median ADE across all 1,000 test clips |
+| **Online Streaming ADE** | **2.707** | meters | Real-time causal state estimate error at each step |
+| **Final Displacement Error (FDE)** | **6.139** | meters | Positional error at trajectory termination |
+| **X MAE ($p_x$)** | **1.312** | meters | Lateral position mean absolute error |
+| **Y MAE ($p_y$)** | **1.875** | meters | Longitudinal position mean absolute error |
 
 ### All Runs — Blind Test Results
 
-| Run | Dataset | Training Changes | Best Val Loss | ADE ↓ | Median ADE ↓ | Online ADE ↓ | FDE ↓ | X MAE ↓ | Y MAE ↓ |
+| Run | Dataset | Training & Decoder Changes | Best Val Loss | ADE ↓ | Median ADE ↓ | Online ADE ↓ | FDE ↓ | X MAE ↓ | Y MAE ↓ |
 | :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`vs13_7500_varied_improved`** 🏆 | 7,500 clips | + Soft labels, kinematic loss, SpecAugment | 2.1622† | **2.806 m** | **2.422 m** | **2.821 m** | 7.623 m | 1.525 m | **1.988 m** |
-| `vs13_7500_varied_cnn` | 7,500 clips | + Frequency CNN frontend | **1.8173** | 2.965 m | 2.612 m | 3.013 m | **7.333 m** | **1.385 m** | 2.301 m |
+| **`vs13_7500_varied_poshead` (Expectation RTS)** 🏆 | 7,500 clips | + Auxiliary PosHead, Endpoint ramp, Expectation RTS | 2.1473† | **2.549 m** | **2.251 m** | **2.707 m** | **6.139 m** | **1.312 m** | **1.875 m** |
+| `vs13_7500_varied_poshead` (Beam RTS) | 7,500 clips | + Auxiliary PosHead, Endpoint ramp, Beam search | 2.1473† | 2.660 m | 2.306 m | 2.707 m | 7.087 m | 1.319 m | 1.979 m |
+| `vs13_7500_varied_improved` | 7,500 clips | + Soft labels, kinematic loss, SpecAugment | 2.1622† | 2.806 m | 2.422 m | 2.821 m | 7.623 m | 1.525 m | 1.988 m |
+| `vs13_7500_varied_cnn` | 7,500 clips | + Frequency CNN frontend | **1.8173** | 2.965 m | 2.612 m | 3.013 m | 7.333 m | 1.385 m | 2.301 m |
 | `vs13_7500_varied_v1` | 7,500 clips | Baseline (linear projection) | 1.9416 | 3.043 m | — | 3.093 m | 7.748 m | — | — |
 | `smoke_1000` | 1,000 clips | + Soft labels, kinematic loss, SpecAugment | 2.2886† | 4.365 m | 3.775 m | 4.567 m | 9.947 m | 2.679 m | 2.840 m |
 | `vs13_1000_option_a_cnn` | 1,000 clips | + Frequency CNN frontend | 2.1404 | 4.158 m | — | 4.194 m | 10.070 m | — | — |
 | `vs13_1000_option_a` | 1,000 clips | Baseline (linear projection) | 2.1588 | 5.047 m | — | 5.102 m | 11.009 m | — | — |
 | Original baseline | 1,000 clips | — | 2.8428 | — | — | — | — | — | — |
 
-> † Val loss not directly comparable to earlier runs — Gaussian soft-label CE + kinematic loss terms inflate the absolute loss value.
+> † Val loss not directly comparable to earlier runs — Gaussian soft-label CE + kinematic loss + auxiliary position regression terms shift the absolute loss scale.
 
 ---
 

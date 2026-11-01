@@ -20,12 +20,13 @@ def main():
     x = torch.randn(1, 75, c['feat_in'])
     p0 = torch.tensor([[-75.0, 22.579128]])
     with torch.no_grad():
-        full, _ = model(x, p0)
+        full, _, pos_full = model(x, p0)
         changed = x.clone()
         changed[:, 40:] += 20 * torch.randn_like(changed[:, 40:])
-        other, _ = model(changed, p0)
+        other, _, _ = model(changed, p0)
         for a, b in zip(full, other):
             torch.testing.assert_close(a[:, :40], b[:, :40], atol=1e-5, rtol=1e-4)
+        assert pos_full.shape == (1, 75, 2), f"position_head shape wrong: {pos_full.shape}"
         chunks, cache = [[] for _ in range(4)], None
         for start in range(0, x.shape[1], 9):
             out, cache = model.predict_chunk(x[:, start:start + 9], p0, cache)
@@ -36,15 +37,22 @@ def main():
         assert cache[0].shape[2] == c['left_context']
         assert cache[2].item() == c['left_context']
     model.train()
-    logits, _ = model(x[:, :27], p0)
+    logits, _, pos_pred_full = model(x[:, :27], p0)
     selected = [z[0, [8, 17, 26]] for z in logits]
+    pos_pred = pos_pred_full[0, [8, 17, 26]]   # [3, 2]
     target = torch.tensor([[60, 60, 62, 61]] * 3)
-    loss, _ = motion_loss(selected, target, model.bins, [0.1, 0.2, 0.3], p0[0],
-                          kinematic_weight=0.05, acceleration_weight=0.01)
+    gt_position = torch.tensor([[-75.0, 22.0]] * 3)
+    loss, terms = motion_loss(selected, target, model.bins, [0.1, 0.2, 0.3], p0[0],
+                              pos_pred=pos_pred, gt_position=gt_position,
+                              kinematic_weight=0.05, acceleration_weight=0.01)
     loss.backward()
     assert torch.isfinite(loss)
+    assert torch.isfinite(terms['pos_loss']) and terms['pos_loss'].item() > 0, \
+        "position head loss should be nonzero"
     for head in model.heads:
         assert head.weight.grad is not None and torch.isfinite(head.weight.grad).all()
+    assert model.position_head[0].weight.grad is not None, \
+        "position_head should receive gradients"
     assert model.encoder.pre_encode.weight.grad is not None
     decoder = MotionDecoder(p0[0].numpy(), BINS)
     for n in range(5):
@@ -57,10 +65,17 @@ def main():
     t_smooth, path_smooth = decoder.best_path(adaptive_noise=True)
     assert len(t_smooth) == 6 and np.isfinite(path_smooth).all()
 
+    # Verify expectation + RTS decoder (no beam search)
+    from decoder import expectation_rts_path
+    exp = np.tile([[10.0, 0.0, -70.0, 22.0]], (5, 1))
+    t_e, path_e = expectation_rts_path(p0[0].numpy(), np.arange(1, 6) / 10, exp)
+    assert path_e.shape == (6, 4) and np.isfinite(path_e).all()
+    assert np.allclose(path_e[0, 2:], p0[0].numpy(), atol=1e-4)
+
     # Verify SpectroTemporalCNN and FiLM conditioning
     c_film = dict(c, frontend='spectro_temporal_cnn', spatial_conditioning='film')
     m_film = MotionModel(settings=c_film).train()
-    out_film, _ = m_film(x[:, :15], p0)
+    out_film, _, _ = m_film(x[:, :15], p0)
     loss_film = sum(z.sum() for z in out_film)
     loss_film.backward()
     assert m_film.film_gen[0].weight.grad is not None
@@ -78,7 +93,7 @@ def main():
         assert features.shape[1] == c['feat_in']
         assert len(y) == len(ix) == len(seconds) and ix[-1] < len(features)
         print(f'Sample OK: {len(features)} features, {len(seconds)} outputs, p0={start}')
-    print('PASS: causal outputs, streaming/full equivalence, four-head gradients, 2D CNN, FiLM, augmentations, and adaptive decoder')
+    print('PASS: causal outputs, streaming/full equivalence, four-head gradients, position head, endpoint weighting, 2D CNN, FiLM, augmentations, and adaptive decoder')
 
 
 if __name__ == '__main__':

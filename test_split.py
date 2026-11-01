@@ -11,7 +11,8 @@ from tqdm import tqdm
 
 from config import NAMES
 from data import initial_position, load_audio
-from decoder import MotionDecoder
+import config as C
+from decoder import MotionDecoder, expectation_rts_path
 from model import MotionModel
 from plot import plot_prediction, plot_xy_prediction
 
@@ -38,7 +39,10 @@ def predict_one(model, checkpoint, sample, device):
         raw.append([b[p.argmax()] for b, p in zip(bins, last_probs)])
         means.append([float(b @ p) for b, p in zip(bins, last_probs)])
         online.append(decoder.step(last_probs, second))
-    path_seconds, revised_path = decoder.best_path()
+    if C.DECODER_MODE == 'expectation_rts':
+        path_seconds, revised_path = expectation_rts_path(p0, seconds, np.asarray(means))
+    else:
+        path_seconds, revised_path = decoder.best_path()
     return dict(seconds=seconds, initial_position=p0,
                 online_estimates=np.asarray(online), raw_argmax=np.asarray(raw),
                 raw_expectation=np.asarray(means), path_seconds=path_seconds,

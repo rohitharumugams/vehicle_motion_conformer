@@ -29,6 +29,8 @@ HEAD_WEIGHTS = (1.0, 1.0, 1.0, 1.0)
 KINEMATIC_WEIGHT = 0.05
 ACCELERATION_WEIGHT = 0.01
 LABEL_SMOOTHING_SIGMA = 1.0
+POSITION_HEAD_WEIGHT = 0.1   # auxiliary direct regression head for px, py
+ENDPOINT_WEIGHT = 3.0        # how much more to weight the final timestep vs first
 MAX_ACCEL_MPS2 = 8.0
 MAX_SPEED_KMPH = 120.0
 BEAM_SIZE = 32
@@ -36,6 +38,11 @@ INITIAL_TOP_K = 8
 BRANCH_TOP_K = 3
 DECODER_ACCEL_PENALTY = 0.1
 DECODER_MOTION_WEIGHT = 1.5
+# 'expectation_rts' smooths per-step head expectations directly; 'beam_rts' is the older beam search.
+DECODER_MODE = 'expectation_rts'
+EXPECTATION_RTS_Q_ACCEL = 6.0
+EXPECTATION_RTS_R_POS = 1.5
+EXPECTATION_RTS_R_VEL = 4.0
 
 FRONTEND = 'frequency_cnn'
 SPATIAL_CONDITIONING = 'concat'
