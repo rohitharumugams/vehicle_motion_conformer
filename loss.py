@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from config import (HEAD_WEIGHTS, KINEMATIC_WEIGHT, ACCELERATION_WEIGHT,
                     MAX_ACCEL_MPS2, LABEL_SMOOTHING_SIGMA,
-                    POSITION_HEAD_WEIGHT, ENDPOINT_WEIGHT)
+                    POSITION_HEAD_WEIGHT, ENDPOINT_WEIGHT, HEADING_WEIGHT)
 
 
 def gaussian_soft_target(target_indices, num_classes, sigma=1.0, device='cpu'):
@@ -26,9 +26,10 @@ def motion_loss(logits, target, bins, seconds, p0, pos_pred=None,
                 acceleration_weight=ACCELERATION_WEIGHT,
                 label_smoothing_sigma=LABEL_SMOOTHING_SIGMA,
                 position_head_weight=POSITION_HEAD_WEIGHT,
-                endpoint_weight=ENDPOINT_WEIGHT):
+                endpoint_weight=ENDPOINT_WEIGHT,
+                heading_weight=HEADING_WEIGHT):
     """Four categorical CE losses (with Gaussian soft targets and endpoint weighting)
-    plus soft physics penalties plus optional auxiliary direct-position regression loss."""
+    plus soft physics penalties, direct-position regression loss, and heading vector direction loss."""
     T = logits[0].shape[0]
     w = endpoint_weights(T, endpoint_weight=endpoint_weight, device=logits[0].device)
 
@@ -64,15 +65,26 @@ def motion_loss(logits, target, bins, seconds, p0, pos_pred=None,
 
     total = total + kinematic_weight * kinematic + acceleration_weight * acceleration
 
-    # Auxiliary direct position regression loss.
+    # Heading direction loss: penalizes angular tilt between predicted and ground-truth velocity vectors
+    heading_loss = means.new_zeros(())
+    gt_velocity = torch.stack([bins[0][target[:, 0]], bins[1][target[:, 1]]], dim=-1) / 3.6
+    gt_speed = torch.linalg.vector_norm(gt_velocity, dim=-1)
+    pred_speed = torch.linalg.vector_norm(velocity, dim=-1)
+    # Only compute heading where the car is actively moving (> 1 m/s)
+    active_mask = gt_speed > 1.0
+    if active_mask.any():
+        u_pred = velocity[active_mask] / (pred_speed[active_mask, None] + 1e-4)
+        u_gt = gt_velocity[active_mask] / (gt_speed[active_mask, None] + 1e-4)
+        cos_sim = (u_pred * u_gt).sum(dim=-1)
+        heading_loss = ((1.0 - cos_sim) * w[active_mask]).mean()
+        total = total + heading_weight * heading_loss
+
+    # Auxiliary direct position regression loss (anchored residual from p0).
     pos_loss = means.new_zeros(())
     if pos_pred is not None and gt_position is not None:
-        # pos_pred: [T, 2] raw regression output (px, py) in metres
-        # gt_position: [T, 2] ground-truth (px, py) in metres
-        # Weight by endpoint ramp so the final position matters more
         pos_residual = (pos_pred - gt_position) * w[:, None]
         pos_loss = F.smooth_l1_loss(pos_residual / 10.0, torch.zeros_like(pos_residual))
         total = total + position_head_weight * pos_loss
 
     return total, dict(ce=ce, kinematic=kinematic, acceleration=acceleration,
-                       pos_loss=pos_loss, means=means)
+                       heading_loss=heading_loss, pos_loss=pos_loss, means=means)

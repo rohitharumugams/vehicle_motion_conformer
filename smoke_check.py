@@ -47,6 +47,8 @@ def main():
                               kinematic_weight=0.05, acceleration_weight=0.01)
     loss.backward()
     assert torch.isfinite(loss)
+    assert 'heading_loss' in terms and torch.isfinite(terms['heading_loss']), \
+        "heading loss should be computed and finite"
     assert torch.isfinite(terms['pos_loss']) and terms['pos_loss'].item() > 0, \
         "position head loss should be nonzero"
     for head in model.heads:

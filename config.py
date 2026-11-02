@@ -31,6 +31,7 @@ ACCELERATION_WEIGHT = 0.01
 LABEL_SMOOTHING_SIGMA = 1.0
 POSITION_HEAD_WEIGHT = 0.1   # auxiliary direct regression head for px, py
 ENDPOINT_WEIGHT = 3.0        # how much more to weight the final timestep vs first
+HEADING_WEIGHT = 0.2         # heading direction angle loss (cosine similarity on velocity vector)
 MAX_ACCEL_MPS2 = 8.0
 MAX_SPEED_KMPH = 120.0
 BEAM_SIZE = 32
