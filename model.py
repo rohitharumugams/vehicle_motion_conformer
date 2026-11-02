@@ -78,16 +78,19 @@ class MotionModel(nn.Module):
             self.settings = dict(model_config())
             self.settings.setdefault("frontend", "frequency_cnn")
             self.settings.setdefault("spatial_conditioning", "concat")
+            self.settings.setdefault("energy_conditioning", True)
         else:
             # Old checkpoints without this field retain the original model.
             self.settings = dict(settings)
             self.settings.setdefault("frontend", "linear")
             self.settings.setdefault("spatial_conditioning", "concat")
+            self.settings.setdefault("energy_conditioning", False)
 
         c = self.settings
         self.feat_in = c["feat_in"]
         self.position_scale = c["position_scale"]
         self.spatial_conditioning = c["spatial_conditioning"]
+        self.energy_conditioning = c.get("energy_conditioning", False)
 
         bins = BINS if bins is None else bins
         for j, b in enumerate(bins):
@@ -125,7 +128,8 @@ class MotionModel(nn.Module):
             encoder_feat_in = raw_feat_dim
         else:
             self.film_gen = None
-            encoder_feat_in = raw_feat_dim + 2
+            extra_dim = 3 if self.energy_conditioning else 2
+            encoder_feat_in = raw_feat_dim + extra_dim
 
         self.encoder = ConformerEncoder(
             feat_in=encoder_feat_in,
@@ -154,9 +158,15 @@ class MotionModel(nn.Module):
             nn.Linear(c["hidden"], len(b)) for b in bins
         )
 
-        # Auxiliary direct position regression head: predicts (px, py) in metres.
-        # Used only during training as an extra anchor loss; not used during decoding.
+        # Auxiliary direct position regression head: predicts displacement (dpx, dpy) from p0 in metres.
         self.position_head = nn.Sequential(
+            nn.Linear(c["hidden"], 64),
+            nn.GELU(),
+            nn.Linear(64, 2),
+        )
+
+        # Auxiliary polar physics head: predicts [range (m), radial_velocity (m/s)].
+        self.polar_head = nn.Sequential(
             nn.Linear(c["hidden"], 64),
             nn.GELU(),
             nn.Linear(64, 2),
@@ -193,6 +203,10 @@ class MotionModel(nn.Module):
                 .unsqueeze(1)
                 .expand(-1, x.shape[1], -1)
             )
+            if self.energy_conditioning:
+                mean_energy = torch.clamp(torch.mean(x, dim=-1, keepdim=True), min=0.0)
+                frame_energy = torch.log1p(mean_energy) / 5.0
+                context = torch.cat((context, frame_energy), dim=-1)
             features = torch.cat(
                 (spectral_features, context), dim=-1
             ).transpose(1, 2)
@@ -223,7 +237,12 @@ class MotionModel(nn.Module):
             None if cache is None else (out[2], out[3], out[4])
         )
 
-        return [head(z) for head in self.heads], next_cache, self.position_head(z)
+        # Residual anchoring: pos_pred = p0 + delta_p
+        delta_p = self.position_head(z)
+        pos_pred = p0.to(x).unsqueeze(1) + delta_p
+        polar_pred = self.polar_head(z)
+
+        return [head(z) for head in self.heads], next_cache, pos_pred, polar_pred
 
     def initial_cache(self, batch_size=1):
         p = next(self.parameters())
@@ -241,5 +260,5 @@ class MotionModel(nn.Module):
             cache = self.initial_cache(x.shape[0])
 
         with torch.inference_mode():
-            logits, next_cache, _ = self.forward(x, p0, cache)
+            logits, next_cache, _, _ = self.forward(x, p0, cache)
             return logits, next_cache

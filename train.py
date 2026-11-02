@@ -47,6 +47,8 @@ def main():
     parser.add_argument('--checkpoint', default='model.pt')
     parser.add_argument('--split', default='3way',
                         help='Path to existing split.json, or "2way" or "3way"')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from existing checkpoint')
     args = parser.parse_args()
     if args.epochs < 1:
         parser.error('--epochs must be positive')
@@ -76,7 +78,22 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=C.LR, weight_decay=C.WEIGHT_DECAY)
     best = float('inf')
     history = []
-    for epoch in range(args.epochs):
+    start_epoch = 0
+
+    if args.resume and ckpt_path.is_file():
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt['model'])
+        best = ckpt.get('val_loss', float('inf'))
+        start_epoch = ckpt.get('epoch', 0)
+        hist_file = run_dir / 'history.json'
+        if hist_file.is_file():
+            try:
+                history = json.loads(hist_file.read_text())
+            except Exception:
+                pass
+        print(f"Resumed from {ckpt_path.name} at epoch {start_epoch}, previous best val_loss: {best:.4f}")
+
+    for epoch in range(start_epoch, start_epoch + args.epochs):
         record = {'epoch': epoch + 1}
         for paths, training in ((train, True), (val, False)):
             model.train(training)
@@ -86,24 +103,27 @@ def main():
                 rng.shuffle(paths)
             with torch.set_grad_enabled(training):
                 phase = 'train' if training else 'val'
-                for p, (x, y, ix, seconds, p0) in tqdm(
+                for p, (x, y, ix, seconds, p0, polar) in tqdm(
                     prefetch_loader(paths, augment=training), total=len(paths),
-                    desc=f'epoch {epoch + 1}/{args.epochs} {phase}',
+                    desc=f'epoch {epoch + 1}/{start_epoch + args.epochs} {phase}',
                     unit='clip', leave=False
                 ):
                     x = torch.from_numpy(x)[None].to(device)
                     y = torch.from_numpy(y).to(device)
                     ix = torch.from_numpy(ix).to(device)
                     p0 = torch.from_numpy(p0)[None].to(device)
-                    output, _, pos_pred_full = model(x, p0)
+                    polar = torch.from_numpy(polar).to(device)
+                    output, _, pos_pred_full, polar_pred_full = model(x, p0)
                     logits = [z[0, ix] for z in output]
                     # pos_pred at the sampled timesteps; ground-truth px,py in metres
                     pos_pred = pos_pred_full[0, ix]          # [T, 2]
+                    polar_pred = polar_pred_full[0, ix]      # [T, 2]: [range_m, vr_mps]
                     gt_position = torch.stack(
                         [model.bins[2][y[:, 2]], model.bins[3][y[:, 3]]], dim=-1
                     )                                        # [T, 2]
                     loss, terms = motion_loss(logits, y, model.bins, seconds, p0[0],
-                                             pos_pred=pos_pred, gt_position=gt_position)
+                                             pos_pred=pos_pred, gt_position=gt_position,
+                                             polar_pred=polar_pred, gt_polar=polar)
                     if not torch.isfinite(loss):
                         raise RuntimeError(f'Nonfinite loss on {p}')
                     if training:
@@ -136,7 +156,10 @@ def main():
                                                  acceleration_weight=C.ACCELERATION_WEIGHT,
                                                  label_smoothing_sigma=C.LABEL_SMOOTHING_SIGMA,
                                                  position_head_weight=C.POSITION_HEAD_WEIGHT,
-                                                 endpoint_weight=C.ENDPOINT_WEIGHT))
+                                                 endpoint_weight=C.ENDPOINT_WEIGHT,
+                                                 path_int_weight=C.PATH_INTEGRATION_WEIGHT,
+                                                 polar_weight=C.POLAR_HEAD_WEIGHT,
+                                                 geometric_weight=C.GEOMETRIC_WEIGHT))
             torch.save(checkpoint, ckpt_path)
 
 

@@ -20,13 +20,14 @@ def main():
     x = torch.randn(1, 75, c['feat_in'])
     p0 = torch.tensor([[-75.0, 22.579128]])
     with torch.no_grad():
-        full, _, pos_full = model(x, p0)
+        full, _, pos_full, polar_full = model(x, p0)
         changed = x.clone()
         changed[:, 40:] += 20 * torch.randn_like(changed[:, 40:])
-        other, _, _ = model(changed, p0)
+        other, _, _, _ = model(changed, p0)
         for a, b in zip(full, other):
             torch.testing.assert_close(a[:, :40], b[:, :40], atol=1e-5, rtol=1e-4)
         assert pos_full.shape == (1, 75, 2), f"position_head shape wrong: {pos_full.shape}"
+        assert polar_full.shape == (1, 75, 2), f"polar_head shape wrong: {polar_full.shape}"
         chunks, cache = [[] for _ in range(4)], None
         for start in range(0, x.shape[1], 9):
             out, cache = model.predict_chunk(x[:, start:start + 9], p0, cache)
@@ -37,22 +38,30 @@ def main():
         assert cache[0].shape[2] == c['left_context']
         assert cache[2].item() == c['left_context']
     model.train()
-    logits, _, pos_pred_full = model(x[:, :27], p0)
+    logits, _, pos_pred_full, polar_pred_full = model(x[:, :27], p0)
     selected = [z[0, [8, 17, 26]] for z in logits]
-    pos_pred = pos_pred_full[0, [8, 17, 26]]   # [3, 2]
+    pos_pred = pos_pred_full[0, [8, 17, 26]]     # [3, 2]
+    polar_pred = polar_pred_full[0, [8, 17, 26]] # [3, 2]
     target = torch.tensor([[60, 60, 62, 61]] * 3)
     gt_position = torch.tensor([[-75.0, 22.0]] * 3)
+    gt_polar = torch.tensor([[78.0, -10.0]] * 3)
     loss, terms = motion_loss(selected, target, model.bins, [0.1, 0.2, 0.3], p0[0],
                               pos_pred=pos_pred, gt_position=gt_position,
+                              polar_pred=polar_pred, gt_polar=gt_polar,
                               kinematic_weight=0.05, acceleration_weight=0.01)
     loss.backward()
     assert torch.isfinite(loss)
     assert torch.isfinite(terms['pos_loss']) and terms['pos_loss'].item() > 0, \
         "position head loss should be nonzero"
+    assert torch.isfinite(terms['path_int_loss']), "path integration loss should be finite"
+    assert torch.isfinite(terms['polar_loss']), "polar loss should be finite"
+    assert torch.isfinite(terms['geo_loss']), "geometric loss should be finite"
     for head in model.heads:
         assert head.weight.grad is not None and torch.isfinite(head.weight.grad).all()
     assert model.position_head[0].weight.grad is not None, \
         "position_head should receive gradients"
+    assert model.polar_head[0].weight.grad is not None, \
+        "polar_head should receive gradients"
     assert model.encoder.pre_encode.weight.grad is not None
     decoder = MotionDecoder(p0[0].numpy(), BINS)
     for n in range(5):
@@ -75,7 +84,7 @@ def main():
     # Verify SpectroTemporalCNN and FiLM conditioning
     c_film = dict(c, frontend='spectro_temporal_cnn', spatial_conditioning='film')
     m_film = MotionModel(settings=c_film).train()
-    out_film, _, _ = m_film(x[:, :15], p0)
+    out_film, _, _, _ = m_film(x[:, :15], p0)
     loss_film = sum(z.sum() for z in out_film)
     loss_film.backward()
     assert m_film.film_gen[0].weight.grad is not None
@@ -89,11 +98,12 @@ def main():
 
     if args.sample:
         from data import load
-        features, y, ix, seconds, start = load(args.sample)
+        features, y, ix, seconds, start, polar = load(args.sample)
         assert features.shape[1] == c['feat_in']
         assert len(y) == len(ix) == len(seconds) and ix[-1] < len(features)
-        print(f'Sample OK: {len(features)} features, {len(seconds)} outputs, p0={start}')
-    print('PASS: causal outputs, streaming/full equivalence, four-head gradients, position head, endpoint weighting, 2D CNN, FiLM, augmentations, and adaptive decoder')
+        assert polar.shape == (len(seconds), 2)
+        print(f'Sample OK: {len(features)} features, {len(seconds)} outputs, p0={start}, polar shape={polar.shape}')
+    print('PASS: causal outputs, streaming/full equivalence, four-head gradients, position head, polar head, path integration, 2D CNN, FiLM, augmentations, and adaptive decoder')
 
 
 if __name__ == '__main__':

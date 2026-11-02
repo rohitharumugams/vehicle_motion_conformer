@@ -31,6 +31,9 @@ ACCELERATION_WEIGHT = 0.01
 LABEL_SMOOTHING_SIGMA = 1.0
 POSITION_HEAD_WEIGHT = 0.1   # auxiliary direct regression head for px, py
 ENDPOINT_WEIGHT = 3.0        # how much more to weight the final timestep vs first
+PATH_INTEGRATION_WEIGHT = 0.1 # cumulative velocity integration heading loss
+POLAR_HEAD_WEIGHT = 0.1      # auxiliary polar physics head: range and radial velocity
+GEOMETRIC_WEIGHT = 0.05      # geometric consistency tying Cartesian norm(p) to range
 MAX_ACCEL_MPS2 = 8.0
 MAX_SPEED_KMPH = 120.0
 BEAM_SIZE = 32
@@ -46,6 +49,7 @@ EXPECTATION_RTS_R_VEL = 4.0
 
 FRONTEND = 'frequency_cnn'
 SPATIAL_CONDITIONING = 'concat'
+ENERGY_CONDITIONING = True
 AUGMENT_SPEC = True
 
 
@@ -54,7 +58,8 @@ def model_config():
                 attention_heads=ATTENTION_HEADS, left_context=LEFT_CONTEXT,
                 conv_kernel=CONV_KERNEL, position_scale=POSITION_SCALE,
                 dropout=DROPOUT, frontend=FRONTEND,
-                spatial_conditioning=SPATIAL_CONDITIONING)
+                spatial_conditioning=SPATIAL_CONDITIONING,
+                energy_conditioning=ENERGY_CONDITIONING)
 
 
 def feature_config():

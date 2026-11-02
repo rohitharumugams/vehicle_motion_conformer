@@ -97,7 +97,25 @@ def load(path, bins=BINS, augment=False, rng=None):
             raise ValueError(f'{p}: head {j} target outside bins; widen BINS in config.py')
     y = np.stack([np.abs(values[:, j, None] - b).argmin(1)
                   for j, b in enumerate(bins)], 1).astype(np.int64)
-    return x, y, ix, seconds, p0
+
+    # Polar ground truth: range (m) and radial velocity (m/s) relative to mic at (0, 0)
+    range_path = p / 'metadata/range_m.npy'
+    vr_path = p / 'metadata/radial_velocity_mps.npy'
+    if range_path.is_file() and vr_path.is_file():
+        r_raw = np.load(range_path)
+        vr_raw = np.load(vr_path)
+        polar = np.stack([np.interp(seconds, t, r_raw),
+                          np.interp(seconds, t, vr_raw)], axis=-1).astype(np.float32)
+    else:
+        gx = np.interp(seconds, t, s[:, 0])
+        gy = np.interp(seconds, t, s[:, 2])
+        gvx = np.interp(seconds, t, s[:, 1])
+        gvy = np.interp(seconds, t, s[:, 3])
+        r_calc = np.maximum(np.hypot(gx, gy), 0.1)
+        vr_calc = (gx * gvx + gy * gvy) / r_calc
+        polar = np.stack([r_calc, vr_calc], axis=-1).astype(np.float32)
+
+    return x, y, ix, seconds, p0, polar
 
 
 def split(paths):
