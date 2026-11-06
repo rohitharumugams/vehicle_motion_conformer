@@ -19,6 +19,7 @@ All models evaluated on the held-out independent blind test dataset (`/Users/roh
 | 7 | **`vs13_7500_varied_poshead` (Beam)** | 7,500 | 50 | + Auxiliary PosHead, Endpoint loss ramp ($1\times \rightarrow 3\times$) | 2.1473† | 2.660 | 2.306 | 2.707 | 7.087 | 1.319 | 1.979 |
 | 8 | **`vs13_7500_varied_poshead` (Expectation RTS)** 🏆 | 7,500 | 50 | Same checkpoint + Expectation RTS smoother ($q=6, r=1.5$) | 2.1473† | **2.549** | **2.251** | **2.707** | **6.139** | **1.312** | **1.875** |
 | 9 | **`vs13_7500_varied_physics`** | 7,500 | 59 | + Energy channel, Polar head ($r, v_r$), Path integration | 2.1881† | 2.621 | 2.351 | 2.767 | 6.545 | 1.397 | 1.902 |
+| 10 | **`vs13_7500_varied_heading`** | 7,500 | 32 | + Heading direction cosine loss ($\mathcal{L}_{\text{heading}}$, weight 0.2) | 2.1967† | 2.913 | 2.649 | 3.165 | 6.715 | 1.484 | 2.184 |
 
 > † Note: Validation loss values marked with (†) are not directly comparable to earlier CE-only runs because Gaussian soft targets, kinematic penalties, and auxiliary regression loss terms alter the baseline loss entropy and magnitude.
 
@@ -35,6 +36,7 @@ Percentage of test clips achieving Average Displacement Error (ADE) below given 
 | `vs13_7500_varied_poshead` (Beam) | 4.4% | 40.2% | 93.2% | 99.7% | 100.0% |
 | **`vs13_7500_varied_poshead` (Expectation RTS)** 🏆 | **4.1%** | **41.2%** | **94.8%** | **100.0%** | **100.0%** |
 | `vs13_7500_varied_physics` | 3.8% | 37.0% | 93.9% | 99.9% | 100.0% |
+| `vs13_7500_varied_heading` | 2.6% | 26.4% | 92.2% | 99.9% | 100.0% |
 
 ---
 
@@ -47,6 +49,7 @@ Percentile and extreme error metrics on the 1,000 blind test clips:
 | `vs13_7500_varied_poshead` (Beam) | 2.660 m | 2.306 m | 4.526 m | 5.478 m | 13.074 m | 7.087 m | 6.061 m | 13.892 m | 16.854 m | 26.446 m |
 | **`poshead` (Expectation RTS)** 🏆 | **2.549 m** | **2.251 m** | **4.258 m** | **5.034 m** | **8.727 m** | **6.139 m** | **5.111 m** | 12.521 m | **14.815 m** | **25.702 m** |
 | `vs13_7500_varied_physics` | 2.621 m | 2.351 m | 4.283 m | 5.273 m | 10.013 m | 6.545 m | 5.466 m | **12.365 m** | 15.561 m | 34.206 m |
+| `vs13_7500_varied_heading` | 2.913 m | 2.649 m | 4.562 m | 5.697 m | 11.336 m | 6.715 m | 5.598 m | 13.048 m | 15.779 m | 31.830 m |
 
 ---
 
