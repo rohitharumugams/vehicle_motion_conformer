@@ -38,13 +38,17 @@ def main():
         assert cache[2].item() == c['left_context']
     model.train()
     logits, _, pos_pred_full = model(x[:, :27], p0)
-    selected = [z[0, [8, 17, 26]] for z in logits]
     pos_pred = pos_pred_full[0, [8, 17, 26]]   # [3, 2]
     target = torch.tensor([[60, 60, 62, 61]] * 3)
     gt_position = torch.tensor([[-75.0, 22.0]] * 3)
-    loss, terms = motion_loss(selected, target, model.bins, [0.1, 0.2, 0.3], p0[0],
-                              pos_pred=pos_pred, gt_position=gt_position,
-                              kinematic_weight=0.05, acceleration_weight=0.01)
+    loss, terms = motion_loss(
+        logits if getattr(model, 'ctc_mode', False) else [z[0, [8, 17, 26]] for z in logits],
+        target, model.bins, [0.1, 0.2, 0.3], p0[0],
+        pos_pred=pos_pred, gt_position=gt_position,
+        sampled_ix=[8, 17, 26] if getattr(model, 'ctc_mode', False) else None,
+        ctc_mode=getattr(model, 'ctc_mode', False),
+        kinematic_weight=0.05, acceleration_weight=0.01
+    )
     loss.backward()
     assert torch.isfinite(loss)
     assert torch.isfinite(terms['pos_loss']) and terms['pos_loss'].item() > 0, \

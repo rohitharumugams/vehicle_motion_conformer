@@ -47,6 +47,8 @@ EXPECTATION_RTS_R_VEL = 4.0
 FRONTEND = 'frequency_cnn'
 SPATIAL_CONDITIONING = 'concat'
 AUGMENT_SPEC = True
+CTC_MODE = True              # Use CTC loss with blank token on full audio frames
+CTC_BLANK_INDEX = 0
 
 
 def model_config():
@@ -54,7 +56,8 @@ def model_config():
                 attention_heads=ATTENTION_HEADS, left_context=LEFT_CONTEXT,
                 conv_kernel=CONV_KERNEL, position_scale=POSITION_SCALE,
                 dropout=DROPOUT, frontend=FRONTEND,
-                spatial_conditioning=SPATIAL_CONDITIONING)
+                spatial_conditioning=SPATIAL_CONDITIONING,
+                ctc_mode=CTC_MODE)
 
 
 def feature_config():

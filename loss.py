@@ -21,33 +21,57 @@ def endpoint_weights(T, endpoint_weight=ENDPOINT_WEIGHT, device='cpu'):
 
 
 def motion_loss(logits, target, bins, seconds, p0, pos_pred=None,
-                gt_position=None,
+                gt_position=None, sampled_ix=None, ctc_mode=False,
                 kinematic_weight=KINEMATIC_WEIGHT,
                 acceleration_weight=ACCELERATION_WEIGHT,
                 label_smoothing_sigma=LABEL_SMOOTHING_SIGMA,
                 position_head_weight=POSITION_HEAD_WEIGHT,
                 endpoint_weight=ENDPOINT_WEIGHT):
-    """Four categorical CE losses (with Gaussian soft targets and endpoint weighting)
-    plus soft physics penalties plus optional auxiliary direct-position regression loss."""
-    T = logits[0].shape[0]
-    w = endpoint_weights(T, endpoint_weight=endpoint_weight, device=logits[0].device)
+    """Four categorical CE or CTC losses plus soft physics penalties and position regression loss."""
+    if ctc_mode:
+        T = target.shape[0]
+        w = endpoint_weights(T, endpoint_weight=endpoint_weight, device=logits[0].device)
+        ce_losses = []
+        T_audio = logits[0].shape[1]
+        for j, z in enumerate(logits):
+            # z: [1, T_audio, num_classes] -> [T_audio, 1, num_classes] for PyTorch CTC loss
+            log_probs = z.log_softmax(dim=-1).permute(1, 0, 2)
+            ctc_targets = (target[:, j] + 1).long().unsqueeze(0)
+            in_len = torch.tensor([T_audio], device=z.device)
+            tgt_len = torch.tensor([T], device=z.device)
+            head_ctc = F.ctc_loss(log_probs, ctc_targets, in_len, tgt_len,
+                                  blank=0, zero_infinity=True)
+            ce_losses.append(head_ctc)
 
-    ce_losses = []
-    for j, z in enumerate(logits):
-        if label_smoothing_sigma is not None and label_smoothing_sigma > 0:
-            soft_target = gaussian_soft_target(target[:, j], z.shape[-1],
-                                               sigma=label_smoothing_sigma,
-                                               device=z.device)
-            per_step = F.cross_entropy(z, soft_target, reduction='none')
+        ce = torch.stack(ce_losses)
+        weights = ce.new_tensor(HEAD_WEIGHTS)
+        total = (ce * weights).sum() / weights.sum()
+
+        if sampled_ix is not None:
+            sampled_logits = [z[0, sampled_ix, 1:] for z in logits]
         else:
-            per_step = F.cross_entropy(z, target[:, j], reduction='none')
-        ce_losses.append((per_step * w).mean())
+            sampled_logits = [z[0, :, 1:] if z.ndim == 3 else z[:, 1:] for z in logits]
+        means = torch.stack([(z.softmax(-1) * b).sum(-1) for z, b in zip(sampled_logits, bins)], -1)
+    else:
+        T = logits[0].shape[0]
+        w = endpoint_weights(T, endpoint_weight=endpoint_weight, device=logits[0].device)
 
-    ce = torch.stack(ce_losses)
-    weights = ce.new_tensor(HEAD_WEIGHTS)
-    total = (ce * weights).sum() / weights.sum()
+        ce_losses = []
+        for j, z in enumerate(logits):
+            if label_smoothing_sigma is not None and label_smoothing_sigma > 0:
+                soft_target = gaussian_soft_target(target[:, j], z.shape[-1],
+                                                   sigma=label_smoothing_sigma,
+                                                   device=z.device)
+                per_step = F.cross_entropy(z, soft_target, reduction='none')
+            else:
+                per_step = F.cross_entropy(z, target[:, j], reduction='none')
+            ce_losses.append((per_step * w).mean())
 
-    means = torch.stack([(z.softmax(-1) * b).sum(-1) for z, b in zip(logits, bins)], -1)
+        ce = torch.stack(ce_losses)
+        weights = ce.new_tensor(HEAD_WEIGHTS)
+        total = (ce * weights).sum() / weights.sum()
+
+        means = torch.stack([(z.softmax(-1) * b).sum(-1) for z, b in zip(logits, bins)], -1)
     times = torch.as_tensor(seconds, device=means.device, dtype=means.dtype)
     velocity = means[:, :2] / 3.6
     position = means[:, 2:]

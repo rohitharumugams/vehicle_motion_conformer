@@ -150,8 +150,10 @@ class MotionModel(nn.Module):
         self.encoder.streaming_cfg.cache_drop_size = 0
         self.encoder.streaming_cfg.drop_extra_pre_encoded = 0
 
+        self.ctc_mode = bool(c.get("ctc_mode", False))
+
         self.heads = nn.ModuleList(
-            nn.Linear(c["hidden"], len(b)) for b in bins
+            nn.Linear(c["hidden"], len(b) + 1 if self.ctc_mode else len(b)) for b in bins
         )
 
         # Auxiliary direct position regression head: predicts (px, py) in metres.

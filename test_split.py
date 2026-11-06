@@ -36,9 +36,18 @@ def predict_one(model, checkpoint, sample, device):
             raise RuntimeError('No acoustic prediction available yet')
         for name, probability in zip(NAMES, last_probs):
             probabilities[name].append(probability.copy())
-        raw.append([b[p.argmax()] for b, p in zip(bins, last_probs)])
-        means.append([float(b @ p) for b, p in zip(bins, last_probs)])
-        online.append(decoder.step(last_probs, second))
+        # In CTC mode, index 0 is blank; extract non-blank bin distribution for spatial metrics
+        clean_probs = []
+        for p, b in zip(last_probs, bins):
+            if len(p) == len(b) + 1:
+                p_bin = p[1:]
+                s = p_bin.sum()
+                clean_probs.append(p_bin / (s if s > 1e-8 else 1.0))
+            else:
+                clean_probs.append(p)
+        raw.append([b[p.argmax()] for b, p in zip(bins, clean_probs)])
+        means.append([float(b @ p) for b, p in zip(bins, clean_probs)])
+        online.append(decoder.step(clean_probs, second))
     if C.DECODER_MODE == 'expectation_rts':
         path_seconds, revised_path = expectation_rts_path(p0, seconds, np.asarray(means))
     else:

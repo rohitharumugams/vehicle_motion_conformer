@@ -102,8 +102,13 @@ def main():
                     gt_position = torch.stack(
                         [model.bins[2][y[:, 2]], model.bins[3][y[:, 3]]], dim=-1
                     )                                        # [T, 2]
-                    loss, terms = motion_loss(logits, y, model.bins, seconds, p0[0],
-                                             pos_pred=pos_pred, gt_position=gt_position)
+                    loss, terms = motion_loss(
+                        output if getattr(model, 'ctc_mode', False) else logits,
+                        y, model.bins, seconds, p0[0],
+                        pos_pred=pos_pred, gt_position=gt_position,
+                        sampled_ix=ix if getattr(model, 'ctc_mode', False) else None,
+                        ctc_mode=getattr(model, 'ctc_mode', False)
+                    )
                     if not torch.isfinite(loss):
                         raise RuntimeError(f'Nonfinite loss on {p}')
                     if training:
