@@ -34,8 +34,6 @@ def predict_one(model, checkpoint, sample, device):
             start = int(end) + 1
         if last_probs is None:
             raise RuntimeError('No acoustic prediction available yet')
-        for name, probability in zip(NAMES, last_probs):
-            probabilities[name].append(probability.copy())
         # In CTC mode, index 0 is blank; extract non-blank bin distribution for spatial metrics
         clean_probs = []
         for p, b in zip(last_probs, bins):
@@ -45,6 +43,8 @@ def predict_one(model, checkpoint, sample, device):
                 clean_probs.append(p_bin / (s if s > 1e-8 else 1.0))
             else:
                 clean_probs.append(p)
+        for name, probability in zip(NAMES, clean_probs):
+            probabilities[name].append(probability.copy())
         raw.append([b[p.argmax()] for b, p in zip(bins, clean_probs)])
         means.append([float(b @ p) for b, p in zip(bins, clean_probs)])
         online.append(decoder.step(clean_probs, second))

@@ -17,9 +17,13 @@ def plot_prediction(predictions, output, sample=None):
         truth = s[:, [1, 3, 0, 2]].copy()
         truth[:, :2] *= 3.6
     for j, (name, ax) in enumerate(zip(NAMES, axes)):
-        mesh = ax.pcolormesh(d['seconds'], d[name + '_bins'], d[name].T,
+        p_data = d[name]
+        b_data = d[name + '_bins']
+        if p_data.shape[1] == len(b_data) + 1:
+            p_data = p_data[:, 1:]
+        mesh = ax.pcolormesh(d['seconds'], b_data, p_data.T,
                             shading='nearest', cmap='Blues', vmin=0,
-                            vmax=max(float(d[name].max()), 1e-8))
+                            vmax=max(float(p_data.max()), 1e-8))
         fig.colorbar(mesh, ax=ax, label='Probability')
         ax.plot(d['seconds'], d['raw_expectation'][:, j], color='orange', lw=1,
                 label='Head expectation')
