@@ -42,6 +42,15 @@ $$v_r(t) = \vec{v}(t) \cdot \frac{\vec{p}(t)}{\|\vec{p}(t)\|} = \frac{x(t) v_x(t
   2. The rapid angle sweep during the Closest Point of Approach (CPA).
   3. Continuous kinematic path integration.
 
+### 1.4 Acoustic Simulator & Dataset Characteristics (`DopplerSim_2.0`)
+All synthetic audio is generated via `DopplerSim_2.0` under realistic physical conditions:
+* **Speed Range:** $30\text{ km/h}$ to $110\text{ km/h}$ with dynamic acceleration and braking.
+* **Trajectory Topologies:** Straight pass-bys, broad highway curves, acute turns, lane-changes, and multi-turn S-curves.
+* **Closest Point of Approach (CPA):** Distance at CPA ranges between $d_{\text{CPA}} \in [5.0\text{ m},\, 45.0\text{ m}]$.
+* **Clip Duration:** $4.0\text{ s}$ to $12.0\text{ s}$ (mean $\approx 7.5\text{ s}$, corresponding to $\approx 75$ output timestamps @ $10\text{ Hz}$).
+* **Acoustic Synthesizer:** Physics-based combustion engine harmonics (firing order pulses), tire-road rolling noise (broadband high-frequency texture), ground reflection multipath interference, and distance-dependent atmospheric air absorption.
+* **Acoustic Leakage Prevention:** In all splits (`split.json`), clips generated from the same engine/vehicle template (`source_clip`) are grouped strictly into either train, validation, or test to prevent the network from memorizing specific engine harmonics.
+
 ---
 
 ## 2. End-to-End System Architecture & Feature Engineering
@@ -100,6 +109,17 @@ Implemented via `nemo.collections.asr.modules.conformer_encoder.ConformerEncoder
 * **Convolutional Kernel Size:** $15$ (`conv_context_size="causal"`, `conv_norm_type="layer_norm"`)
 * **Subsampling:** None (`subsampling_factor=1`) to preserve fine-grained temporal resolution.
 * **Streaming Cache:** `self.encoder.streaming_cfg.cache_drop_size = 0` allows incremental chunk-by-chunk evaluation.
+
+### 2.4 Spatial Conditioning Mechanisms: Concat vs. FiLM Modulation
+Two methods are supported to inform the network of the known starting position $\mathbf{p}_0 = (x_0, y_0)$:
+1. **Direct Concatenation (`spatial_conditioning = 'concat'` — Champion Default):**
+   The coordinates are normalized by $100.0\text{ m}$ and broadcast across all time steps as two constant feature channels appended to the spectral embedding:
+   $$\mathbf{z}_{\text{input}}(t) = \left[ \mathbf{z}_{\text{spectral}}(t);\, \frac{x_0}{100.0};\, \frac{y_0}{100.0} \right] \in \mathbb{R}^{130}$$
+2. **Feature-wise Linear Modulation (`spatial_conditioning = 'film'`):**
+   A conditioning MLP generates affine scale $\gamma(\mathbf{p}_0)$ and shift $\beta(\mathbf{p}_0)$ vectors that dynamically scale and shift the spectral feature maps:
+   $$\big[\gamma(\mathbf{p}_0),\, \beta(\mathbf{p}_0)\big] = \text{MLP}(\mathbf{p}_0)$$
+   $$\mathbf{z}_{\text{input}}(t) = \gamma(\mathbf{p}_0) \odot \mathbf{z}_{\text{spectral}}(t) + \beta(\mathbf{p}_0)$$
+   This allows the initial spatial anchor to directly modulate the gain of specific harmonic filters.
 
 ---
 
@@ -186,6 +206,12 @@ Initialized at final step $T$ with $\hat{\mathbf{x}}_{T|T}$ and $\mathbf{P}_{T|T
 $$\mathbf{C}_k = \mathbf{P}_{k|k} \mathbf{F}^\top \mathbf{P}_{k+1|k}^{-1}$$
 $$\hat{\mathbf{x}}_{k|T} = \hat{\mathbf{x}}_{k|k} + \mathbf{C}_k \big( \hat{\mathbf{x}}_{k+1|T} - \hat{\mathbf{x}}_{k+1|k} \big)$$
 $$\mathbf{P}_{k|T} = \mathbf{P}_{k|k} + \mathbf{C}_k \big( \mathbf{P}_{k+1|T} - \mathbf{P}_{k+1|k} \big) \mathbf{C}_k^\top$$
+
+### 6.4 Zero-Cost Offline Redecoding Protocol (`redecode.py`)
+Because the neural network outputs posterior categorical probability arrays that are cached to disk as `.npz` files:
+* Changing decoder hyperparameters ($Q_{\text{accel}}, R_{\text{pos}}, R_{\text{vel}}$) does **NOT** require re-running GPU neural network inference.
+* The script `redecode.py` directly loads the saved `raw_expectation` matrices and applies the new Kalman smoothing parameters in $< 0.8\text{ ms per clip}$ ($< 1\text{ second}$ for the entire 1,000-clip test set).
+* This allowed instant ablation of decoder dynamics without retraining the neural backbone.
 
 ---
 
